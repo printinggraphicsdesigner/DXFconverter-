@@ -746,36 +746,190 @@ class AIExporter:
         os.remove(tmp)
 
 # ═══════════════════════════════════════════════
-# SVG EXPORTER - With Size Labels
+# SVG EXPORTER — Fixed to include ALL entities
 # ═══════════════════════════════════════════════
+GRADE_COLORS_HEX = [
+    "#FF5050", "#FFA528", "#C8C800", "#000000",
+    "#28B428", "#1E90FF", "#A028FF", "#FF64B4",
+    "#64FFC8", "#FFC864", "#B464FF", "#64C8FF",
+    "#FF9696", "#96FF96", "#9696FF", "#FFFF96",
+    "#FF96FF", "#96FFFF", "#C8C8C8", "#646464",
+]
+
 class SVGExporter:
-    PAD = 15.0
-    def export(self, parser, out_path):
+    """
+    SVG export with TRUE groups.
+    Each size = one <g> containing:
+    - <path> for the pattern outline
+    - <text> for the size label
+    - ALL entities (position marks, notches, grain lines, etc.)
+    """
+    PAD = 15.0  # mm padding
+    
+    def export(self, parser, out_path: str):
         if not parser.bounds:
-            raise RuntimeError("No geometry")
+            raise RuntimeError("Geometry নেই।")
         
         if parser.graded_polys and parser.rul_parser:
             self._export_graded(parser, out_path)
         else:
             self._export_base(parser, out_path)
-    
+
     def _export_graded(self, parser, out_path):
         rul = parser.rul_parser
         sizes = rul.sizes
+        sample = rul.sample
+
+        # Convert all graded polys cm → mm
+        all_mm = {}
+        for sname in sizes:
+            polys = parser.graded_polys.get(sname, [])
+            all_mm[sname] = [
+                [(p[0]*10, p[1]*10) for p in poly]
+                for poly in polys
+            ]
+
+        # Bounds across all sizes in mm
+        all_pts = [p for polys in all_mm.values()
+                   for poly in polys for p in poly]
+        if not all_pts:
+            raise RuntimeError("Geometry নেই।")
+
+        xs = [p[0] for p in all_pts]
+        ys = [p[1] for p in all_pts]
+        b = (min(xs), min(ys), max(xs), max(ys))
+
+        pad = self.PAD
+        x_off = -b[0] + pad
+        y_off = -b[1] + pad
+        svg_w = (b[2]-b[0]) + 2*pad
+        svg_h = (b[3]-b[1]) + 2*pad
+
+        def sx(x): return round(x + x_off, 3)
+        def sy(y): return round(svg_h - (y + y_off), 3)  # flip Y
+
+        lines = self._svg_header(svg_w, svg_h, b)
+
+        # Export ALL sizes with grading
+        for si, sname in enumerate(sizes):
+            polys = all_mm[sname]
+            col = GRADE_COLORS_HEX[si % len(GRADE_COLORS_HEX)]
+            is_base = (sname == sample)
+            sw = "0.5" if is_base else "0.3"
+
+            if not polys:
+                continue
+
+            lines.append(f'   <!-- ═══ Size {sname} ═══ -->')
+            lines.append(f'   <g id="Size_{sname}">')
+
+            for poly in polys:
+                if len(poly) < 2:
+                    continue
+                # Pattern outline
+                d = f"M {sx(poly[0][0])},{sy(poly[0][1])}"
+                for pt in poly[1:]:
+                    d += f" L {sx(pt[0])},{sy(pt[1])}"
+                lines.append(f'     <path d="{d}"')
+                lines.append(f'          fill="none" stroke="{col}"')
+                lines.append(f'          stroke-width="{sw}"/>')
+
+                # Size label
+                gxs = [p[0] for p in poly]
+                gys = [p[1] for p in poly]
+                lx = min(gxs)
+                ly = min(gys) - 7
+                lines.append(f'     <text x="{sx(lx)}" y="{sy(ly)}"')
+                lines.append(f'          font-family="Helvetica,Arial,sans-serif"')
+                lines.append(f'          font-weight="bold" font-size="7"')
+                lines.append(f'          fill="{col}">Size: {sname}</text>')
+
+            lines.append(f'   </g>')
+            lines.append('')
+
+        # ═══════════════════════════════════════════
+        # EXPORT ALL ENTITIES (position marks, notches, etc.)
+        # ═══════════════════════════════════════════
+        entity_lines = []
+        for ent in parser.entities:
+            lay = ent.get("layer", "1")
+            
+            # Skip only bounding box layer
+            if lay == "7":
+                continue
+            
+            # Handle TEXT entities
+            if ent["type"] == "TEXT":
+                if ent["points"]:
+                    px, py = ent["points"][0]
+                    txt = ent.get("text", "")
+                    if txt and not txt.startswith('#'):  # Skip grade rule numbers
+                        entity_lines.append(f'   <text x="{sx(px*10)}" y="{sy(py*10)}"')
+                        entity_lines.append(f'        font-family="Helvetica,Arial,sans-serif"')
+                        entity_lines.append(f'        font-size="6" fill="#888888">{txt}</text>')
+                continue
+            
+            # Handle line/polyline entities (position marks, notches, grain lines, etc.)
+            if len(ent["points"]) < 2:
+                continue
+            
+            pts_mm = [(p[0]*10, p[1]*10) for p in ent["points"]]
+            
+            # Color by layer
+            col_ent = {
+                "14": "#50DC50",  # Sew lines - green
+                "8": "#C8A000",   # Grain lines - gold
+                "4": "#FF6464",   # Notches - red
+                "2": "#A0C8FF",   # Other - light blue
+                "13": "#C896FF",  # Other - purple
+            }.get(lay, "#888888")
+            
+            # Stroke width by layer
+            sw_ent = {
+                "14": "0.25",
+                "8": "0.3",
+                "4": "0.4",
+                "2": "0.25",
+                "13": "0.25",
+            }.get(lay, "0.25")
+            
+            # Create path
+            d = f"M {sx(pts_mm[0][0])},{sy(pts_mm[0][1])}"
+            for pt in pts_mm[1:]:
+                d += f" L {sx(pt[0])},{sy(pt[1])}"
+            
+            entity_lines.append(f'   <path d="{d}"')
+            entity_lines.append(f'        fill="none" stroke="{col_ent}"')
+            entity_lines.append(f'        stroke-width="{sw_ent}"')
+            entity_lines.append(f'        stroke-dasharray="2,2"/>')  # Dashed for internal marks
+
+        # Add all entities in a separate group
+        if entity_lines:
+            lines.append('   <!-- All Position Marks, Notches, Grain Lines -->')
+            lines.append('   <g id="All_Marks_Notches" stroke-linecap="round">')
+            lines.extend(entity_lines)
+            lines.append('   </g>')
+            lines.append('')
+
+        lines.append('</svg>')
         
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+    def _export_base(self, parser, out_path):
+        """Export base size only (no grading)."""
         all_pts = []
-        if parser.graded_polys:
-            for polys in parser.graded_polys.values():
-                for poly in polys:
-                    for p in poly:
-                        all_pts.append((p[0]*10, p[1]*10))
+        for e in parser.entities:
+            for p in e["points"]:
+                all_pts.append((p[0]*10, p[1]*10))
         
         if not all_pts:
-            raise RuntimeError("No geometry")
+            raise RuntimeError("Geometry নেই।")
         
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
         b = (min(xs), min(ys), max(xs), max(ys))
+        
         pad = self.PAD
         x_off = -b[0] + pad
         y_off = -b[1] + pad
@@ -785,92 +939,65 @@ class SVGExporter:
         def sx(x): return round(x + x_off, 3)
         def sy(y): return round(svg_h - (y + y_off), 3)
         
-        lines = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            f'<svg xmlns="http://www.w3.org/2000/svg"',
-            f'    width="{svg_w:.3f}mm" height="{svg_h:.3f}mm"',
-            f'    viewBox="0 0 {svg_w:.3f} {svg_h:.3f}">',
-            ''
-        ]
-        
-        for si, sname in enumerate(sizes):
-            polys = parser.graded_polys.get(sname, [])
-            col = GRADE_COLORS_HEX[si % len(GRADE_COLORS_HEX)]
-            sw = "0.5" if sname == parser.rul_parser.sample else "0.3"
-            
-            lines.append(f'  <!-- Size {sname} -->')
-            lines.append(f'  <g id="Size_{sname}">')
-            
-            for poly in polys:
-                if len(poly) < 2:
-                    continue
-                d = f"M {sx(poly[0][0]*10)},{sy(poly[0][1]*10)}"
-                for pt in poly[1:]:
-                    d += f" L {sx(pt[0]*10)},{sy(pt[1]*10)}"
-                lines.append(f'    <path d="{d}" fill="none" stroke="{col}" stroke-width="{sw}"/>')
-                
-                # SIZE LABEL
-                gxs = [p[0] for p in poly]
-                gys = [p[1] for p in poly]
-                lx = min(gxs)
-                ly = min(gys) - 7
-                lines.append(f'    <text x="{sx(lx*10)}" y="{sy(ly*10)}"')
-                lines.append(f'          font-family="Helvetica,Arial,sans-serif"')
-                lines.append(f'          font-weight="bold" font-size="8" fill="{col}">')
-                lines.append(f'      Size: {sname}')
-                lines.append(f'    </text>')
-            
-            lines.append(f'  </g>')
-            lines.append('')
-        
-        lines.append('</svg>')
-        
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(lines))
-    
-    def _export_base(self, parser, out_path):
-        all_pts = []
-        for e in parser.entities:
-            for p in e["points"]:
-                all_pts.append((p[0]*10, p[1]*10))
-        if not all_pts:
-            raise RuntimeError("No geometry")
-        
-        xs = [p[0] for p in all_pts]
-        ys = [p[1] for p in all_pts]
-        b = (min(xs), min(ys), max(xs), max(ys))
-        pad = self.PAD
-        x_off = -b[0]+pad
-        y_off = -b[1]+pad
-        svg_w = (b[2]-b[0])+2*pad
-        svg_h = (b[3]-b[1])+2*pad
-        
-        def sx(x): return round(x+x_off, 3)
-        def sy(y): return round(svg_h-(y+y_off), 3)
-        
-        lines = [
-            '<?xml version="1.0" encoding="UTF-8"?>',
-            f'<svg xmlns="http://www.w3.org/2000/svg"',
-            f'    width="{svg_w:.3f}mm" height="{svg_h:.3f}mm"',
-            f'    viewBox="0 0 {svg_w:.3f} {svg_h:.3f}">',
-            '  <g id="Base">',
-        ]
+        lines = self._svg_header(svg_w, svg_h, b)
+        lines.append('   <g id="Base_Pattern">')
         
         for ent in parser.entities:
-            pts = ent["points"]
+            lay = ent.get("layer", "1")
+            if lay == "7":
+                continue
+            
+            # TEXT entities
+            if ent["type"] == "TEXT":
+                if ent["points"]:
+                    px, py = ent["points"][0]
+                    txt = ent.get("text", "")
+                    if txt and not txt.startswith('#'):
+                        lines.append(f'   <text x="{sx(px*10)}" y="{sy(py*10)}"')
+                        lines.append(f'        font-family="Helvetica,Arial,sans-serif"')
+                        lines.append(f'        font-size="6" fill="#888888">{txt}</text>')
+                continue
+            
+            # Line/polyline entities
+            pts = [(p[0]*10, p[1]*10) for p in ent["points"]]
             if len(pts) < 2:
                 continue
-            d = f"M {sx(pts[0][0]*10)},{sy(pts[0][1]*10)}"
-            for pt in pts[1:]:
-                d += f" L {sx(pt[0]*10)},{sy(pt[1]*10)}"
-            lines.append(f'    <path d="{d}" fill="none" stroke="#000" stroke-width="0.5"/>')
+            
+            d = f"M {sx(pts[0][0])},{sy(pts[0][1])}"
+            for p in pts[1:]:
+                d += f" L {sx(p[0])},{sy(p[1])}"
+            
+            col = {
+                "1": "#000000", "14": "#50DC50",
+                "8": "#C8A000", "4": "#FF6464"
+            }.get(lay, "#888888")
+            
+            sw = {
+                "1": "0.5", "14": "0.25",
+                "8": "0.3", "4": "0.4"
+            }.get(lay, "0.25")
+            
+            lines.append(f'   <path d="{d}" fill="none"')
+            lines.append(f'        stroke="{col}" stroke-width="{sw}"/>')
         
-        lines.append('  </g>')
+        lines.append('   </g>')
         lines.append('</svg>')
         
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
+    def _svg_header(self, svg_w, svg_h, bounds):
+        b = bounds
+        return [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg"',
+            f'    width="{svg_w:.3f}mm" height="{svg_h:.3f}mm"',
+            f'    viewBox="0 0 {svg_w:.3f} {svg_h:.3f}">',
+            f'  <!-- Flaremo DXF Converter {VERSION} — Actual Size 1:1 -->',
+            f'  <!-- {round(b[2]-b[0],1)} x {round(b[3]-b[1],1)} mm -->',
+            f'  <!-- Open in Illustrator: File → Open (no scaling needed) -->',
+            '',
+        ]
 # ═══════════════════════════════════════════════
 # DXF SAVER
 # ═══════════════════════════════════════════════
