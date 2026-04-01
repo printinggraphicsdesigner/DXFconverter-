@@ -1,6 +1,9 @@
 """
-Flaremo DXF Converter - Complete Flask Web API
-With Full Grading Support (Arc-length Interpolation)
+╔══════════════════════════════════════════════════════════╗
+║   Flaremo DXF Converter - Flask Web API                  ║
+║   AAMA/ASTM DXF + RUL — Full Grading Support             ║
+║   Arc-length proportional interpolation                  ║
+╚══════════════════════════════════════════════════════════╝
 """
 VERSION = "v2.0"
 from flask import Flask, request, jsonify, send_file
@@ -21,6 +24,9 @@ OUTPUT_FOLDER = tempfile.mkdtemp()
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
+# ═══════════════════════════════════════════════
+# COLORS
+# ═══════════════════════════════════════════════
 LAYER_COLORS = {
     "1": (255, 255, 255), "14": (100, 220, 100), "8": (255, 200, 60),
     "4": (255, 120, 120), "7": (50, 50, 80), "2": (160, 200, 255),
@@ -151,7 +157,7 @@ def compute_graded_poly(base_pts, grade_indices, rul, size_idx):
     return graded
 
 # ═══════════════════════════════════════════════
-# DXF PARSER - Extracts geometry + grade points
+# DXF PARSER
 # ═══════════════════════════════════════════════
 class AAMAParser:
     def __init__(self):
@@ -207,7 +213,6 @@ class AAMAParser:
         sc = 0.1 if rw > 20 else 1.0
         self.scale = sc
         
-        # Collect grade-rule TEXT (layer 1, format "# N")
         point_rules = {}
         for ent in block:
             if ent.dxftype() == "TEXT":
@@ -218,7 +223,6 @@ class AAMAParser:
                     key = (round(pos.x*sc, 3), round(pos.y*sc, 3))
                     point_rules[key] = int(m.group(1))
         
-        # Parse geometry
         for ent in block:
             t = ent.dxftype()
             lay = str(getattr(ent.dxf, "layer", "1"))
@@ -299,7 +303,6 @@ class AAMAParser:
                     self._add("LWPOLYLINE", pts, lay)
 
     def attach_rul(self, rul):
-        """Compute graded polys using arc-length interpolation."""
         self.rul_parser = rul
         self.graded_polys = {}
         
@@ -364,7 +367,7 @@ class AAMAParser:
                 for i in range(steps+1)]
 
 # ═══════════════════════════════════════════════
-# PREVIEW RENDERER - Shows ALL graded sizes
+# PREVIEW RENDERER
 # ═══════════════════════════════════════════════
 class PreviewRenderer:
     BG = (13, 15, 20)
@@ -397,13 +400,13 @@ class PreviewRenderer:
         def tx(x): return cx + (x-mxc)*scale
         def ty(y): return cy - (y-myc)*scale
         
-        # Draw graded sizes (ALL sizes with different colors)
+        # Draw ALL graded sizes
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             sample = parser.rul_parser.sample
             for si, sname in enumerate(sizes):
                 if sname == sample:
-                    continue  # Skip base size (drawn with entities)
+                    continue
                 polys = parser.graded_polys.get(sname, [])
                 col = GRADE_COLORS[si % len(GRADE_COLORS)]
                 for poly_pts in polys:
@@ -413,8 +416,8 @@ class PreviewRenderer:
                     for i in range(len(sc2)-1):
                         x1, y1 = sc2[i]
                         x2, y2 = sc2[i+1]
-                        if 38 <= x1 <= cw and 38 <= y1 <= ch and \
-                           38 <= x2 <= cw and 38 <= y2 <= ch:
+                        if RULER <= x1 <= cw and RULER <= y1 <= ch and \
+                           RULER <= x2 <= cw and RULER <= y2 <= ch:
                             draw.line([(x1, y1), (x2, y2)], fill=col, width=1)
         
         # Draw base entities
@@ -429,8 +432,8 @@ class PreviewRenderer:
             for i in range(len(sc2)-1):
                 x1, y1 = sc2[i]
                 x2, y2 = sc2[i+1]
-                if 38 <= x1 <= cw and 38 <= y1 <= ch and \
-                   38 <= x2 <= cw and 38 <= y2 <= ch:
+                if RULER <= x1 <= cw and RULER <= y1 <= ch and \
+                   RULER <= x2 <= cw and RULER <= y2 <= ch:
                     draw.line([(x1, y1), (x2, y2)], fill=col, width=lw)
         
         w_cm = round(dw, 1)
@@ -440,7 +443,7 @@ class PreviewRenderer:
                   f"  {w_cm}x{h_cm}cm  zoom{zoom:.1f}x  sizes:{n_sz}",
                   fill=(110, 140, 200))
         
-        # Legend - show all sizes
+        # Legend
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             sample = parser.rul_parser.sample
@@ -455,7 +458,7 @@ class PreviewRenderer:
         return img
 
 # ═══════════════════════════════════════════════
-# EXPORTERS - PDF, AI, SVG, DXF
+# EXPORTERS
 # ═══════════════════════════════════════════════
 class PDFExporter:
     MARGIN = 1.5
@@ -475,7 +478,6 @@ class PDFExporter:
         def px(x): return (x+ox)*cm
         def py(y): return (y+oy)*cm
         
-        # Draw ALL graded sizes
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             for si, sname in enumerate(sizes):
@@ -491,7 +493,6 @@ class PDFExporter:
                     for pt in poly_pts[1:]:
                         p.lineTo(px(pt[0]), py(pt[1]))
                     c.drawPath(p, stroke=1, fill=0)
-                    # Size label
                     gxs = [pt[0] for pt in poly_pts]
                     gys = [pt[1] for pt in poly_pts]
                     lx = min(gxs)
@@ -499,7 +500,6 @@ class PDFExporter:
                     c.setFont("Helvetica-Bold", 7)
                     c.drawString(px(lx), py(ly), f"Size: {sname}")
         
-        # Draw other entities
         for ent in parser.entities:
             lay = ent.get("layer", "1")
             if lay == "7":
@@ -520,7 +520,6 @@ class PDFExporter:
 
 class AIExporter:
     def export(self, parser, out_path):
-        # Create PDF with AI header
         if not parser.bounds:
             raise RuntimeError("No geometry")
         b = parser.bounds
@@ -659,7 +658,6 @@ class DXFSaver:
             return v*10.0
         
         for ent in parser.entities:
-            etype = ent["type"]
             pts = ent["points"]
             lay = ent.get("layer", "1")
             if len(pts) < 2:
@@ -728,7 +726,6 @@ def upload_rul():
         parser = active_parser[session_id]
         parser.attach_rul(rul)
         
-        # Re-render preview with grading
         img = PreviewRenderer().render(parser, 800, 600, 1.0)
         buffer = io.BytesIO()
         img.save(buffer, format='PNG')
@@ -739,7 +736,8 @@ def upload_rul():
             'preview': preview_b64,
             'sizes': ' '.join(rul.sizes),
             'sample': rul.sample,
-            'sizes_count': len(rul.sizes)
+            'sizes_count': len(rul.sizes),
+            'info': f"Entities: {len(parser.entities)}\nWidth: {round(parser.bounds[2]-parser.bounds[0], 1)} cm\nHeight: {round(parser.bounds[3]-parser.bounds[1], 1)} cm\nGrading: {len(rul.sizes)} sizes ✓"
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
