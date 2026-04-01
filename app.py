@@ -12,6 +12,7 @@ import math
 import re
 import tempfile
 import shutil
+import atexit
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.units import cm
 import ezdxf
@@ -19,15 +20,14 @@ from ezdxf import recover as dxf_recover
 from PIL import Image, ImageDraw
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for cross-origin requests
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
+CORS(app)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
 
 UPLOAD_FOLDER = tempfile.mkdtemp()
 OUTPUT_FOLDER = tempfile.mkdtemp()
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
-# Colors
 LAYER_COLORS = {
     "1": (255, 255, 255),
     "14": (100, 220, 100),
@@ -37,41 +37,8 @@ LAYER_COLORS = {
 }
 DEFAULT_COLOR = (79, 142, 247)
 
-# Session storage
 active_parser = {}
 
-# RUL Parser
-class RULParser:
-    def __init__(self):
-        self.sizes = []
-        self.sample = "M"
-        self.rules = {}
-
-    def parse(self, filepath):
-        with open(filepath, "rb") as f:
-            raw = f.read()
-        text = raw.decode("latin-1", errors="replace")
-        m = re.search(r"SIZE LIST:\s*(.+)", text)
-        if m:
-            self.sizes = m.group(1).strip().split()
-        m = re.search(r"SAMPLE SIZE:\s*(\S+)", text)
-        if m:
-            self.sample = m.group(1).strip()
-        blocks = re.split(r"RULE:\s*DELTA\s+(\d+)", text)
-        i = 1
-        while i < len(blocks) - 1:
-            rnum = int(blocks[i])
-            pairs = re.findall(r"(-?\d+\.?\d*),\s*(-?\d+\.?\d*)", blocks[i+1])
-            if pairs:
-                self.rules[rnum] = [(float(x), float(y)) for x, y in pairs]
-            i += 2
-
-    def get_delta_mm(self, rule_num, size_idx):
-        if rule_num in self.rules and size_idx < len(self.rules[rule_num]):
-            return self.rules[rule_num][size_idx]
-        return (0.0, 0.0)
-
-# DXF Parser
 class AAMAParser:
     def __init__(self):
         self.entities = []
@@ -82,7 +49,6 @@ class AAMAParser:
     def parse(self, filepath):
         self.entities = []
         self.metadata = {}
-
         try:
             doc, _ = dxf_recover.readfile(filepath)
         except Exception as e:
@@ -137,16 +103,6 @@ class AAMAParser:
             elif t == "LINE":
                 s, e = ent.dxf.start, ent.dxf.end
                 self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay)
-
-            elif t == "ARC":
-                pts = self._arc_pts(ent, sc)
-                if pts:
-                    self._add("ARC", pts, lay)
-
-            elif t == "CIRCLE":
-                cx, cy = ent.dxf.center.x*sc, ent.dxf.center.y*sc
-                r = ent.dxf.radius*sc
-                self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
 
             elif t in ("TEXT", "MTEXT"):
                 try:
@@ -205,30 +161,8 @@ class AAMAParser:
                 if v:
                     self.metadata[key] = v
 
-    def _arc_pts(self, arc, sc, steps=64):
-        try:
-            cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
-            r = arc.dxf.radius*sc
-            sa = math.radians(arc.dxf.start_angle)
-            ea = math.radians(arc.dxf.end_angle)
-            if ea < sa:
-                ea += 2*math.pi
-            return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
-                     cy+r*math.sin(sa+(ea-sa)*i/steps))
-                    for i in range(steps+1)]
-        except:
-            return []
-
-    def _circle_pts(self, cx, cy, r, steps=72):
-        return [(cx+r*math.cos(2*math.pi*i/steps),
-                 cy+r*math.sin(2*math.pi*i/steps))
-                for i in range(steps+1)]
-
-# Preview Renderer
 class PreviewRenderer:
     BG = (13, 15, 20)
-    GRID_MAJ = (35, 42, 65)
-    GRID_MIN = (20, 26, 44)
 
     def render(self, parser, cw, ch, zoom=1.0):
         img = Image.new("RGB", (cw, ch), self.BG)
@@ -281,7 +215,6 @@ class PreviewRenderer:
 
         return img
 
-# PDF Exporter
 class PDFExporter:
     MARGIN = 1.5
 
@@ -321,7 +254,6 @@ class PDFExporter:
         c.showPage()
         c.save()
 
-# DXF Saver
 class DXFSaver:
     def save(self, parser, out_path):
         doc = ezdxf.new("R2010")
@@ -348,7 +280,6 @@ class DXFSaver:
             msp.add_lwpolyline(mm_pts, dxfattribs={"layer": lay})
         doc.saveas(out_path)
 
-# API Routes
 @app.route('/api/upload', methods=['POST'])
 def upload():
     try:
@@ -425,4 +356,4 @@ def cleanup():
         pass
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000)
