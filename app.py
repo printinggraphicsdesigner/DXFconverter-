@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════╗
 ║   Flaremo DXF Converter - Flask Web API                  ║
 ║   AAMA/ASTM DXF + RUL — Full Grading Support             ║
-║   Multiple Pattern Pieces + Size Labels                  ║
+║   Shape Preservation - Curves, Arcs, Splines             ║
 ╚══════════════════════════════════════════════════════════╝
 """
 VERSION = "v2.0"
@@ -90,7 +90,7 @@ class RULParser:
         return (0.0, 0.0)
 
 # ═══════════════════════════════════════════════
-# GRADING ENGINE
+# GRADING ENGINE - Arc-length Interpolation
 # ═══════════════════════════════════════════════
 def _arc_length(pts, i1, i2):
     total = 0.0
@@ -166,7 +166,7 @@ def compute_graded_poly(base_pts, grade_indices, rul, size_idx):
     return graded
 
 # ═══════════════════════════════════════════════
-# DXF PARSER
+# DXF PARSER - Full Entity Support
 # ═══════════════════════════════════════════════
 class AAMAParser:
     def __init__(self):
@@ -191,7 +191,15 @@ class AAMAParser:
         except Exception as e:
             raise RuntimeError(f"DXF read error: {e}")
         
+        # Check units
+        try:
+            ins = doc.header.get("$INSUNITS", None)
+        except:
+            ins = None
+        
         msp = doc.modelspace()
+        
+        # First pass: TEXT and INSERT
         for ent in msp:
             if ent.dxftype() == "TEXT":
                 try:
@@ -201,13 +209,16 @@ class AAMAParser:
             elif ent.dxftype() == "INSERT":
                 block = doc.blocks.get(ent.dxf.name)
                 if block:
-                    self._parse_block(block)
+                    self._parse_block(block, ins)
         
+        # Second pass: other entities (if no blocks found)
         if not self.entities:
-            self._parse_entities(msp)
+            self._parse_entities(msp, ins)
+        
         self._update_bounds()
 
-    def _parse_block(self, block):
+    def _parse_block(self, block, ins_hint):
+        # Determine scale from block extents
         raw_xs = []
         for ent in block:
             if ent.dxftype() == "POLYLINE":
@@ -215,13 +226,15 @@ class AAMAParser:
                     raw_xs.append(v.dxf.location.x)
             elif ent.dxftype() == "LINE":
                 raw_xs += [ent.dxf.start.x, ent.dxf.end.x]
+        
         if not raw_xs:
             return
         
         rw = max(raw_xs) - min(raw_xs)
-        sc = 0.1 if rw > 20 else 1.0
+        sc = 0.1 if (ins_hint != 5 and rw > 20) else 1.0
         self.scale = sc
         
+        # Collect grade-rule TEXT (layer 1, format "# N")
         point_rules = {}
         for ent in block:
             if ent.dxftype() == "TEXT":
@@ -232,6 +245,7 @@ class AAMAParser:
                     key = (round(pos.x*sc, 3), round(pos.y*sc, 3))
                     point_rules[key] = int(m.group(1))
         
+        # Parse all geometry
         for ent in block:
             t = ent.dxftype()
             lay = str(getattr(ent.dxf, "layer", "1"))
@@ -276,6 +290,14 @@ class AAMAParser:
                 r = ent.dxf.radius*sc
                 self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
             
+            elif t == "SPLINE":
+                try:
+                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.5)]
+                    if pts:
+                        self._add("SPLINE", pts, lay)
+                except:
+                    pass
+            
             elif t in ("TEXT", "MTEXT"):
                 try:
                     pos = ent.dxf.insert
@@ -291,25 +313,75 @@ class AAMAParser:
                         })
                 except:
                     pass
+            
+            elif t == "INSERT":
+                try:
+                    for sub in ent.virtual_entities():
+                        sl = str(getattr(sub.dxf, "layer", "1"))
+                        st = sub.dxftype()
+                        if st == "LINE":
+                            s2, e2 = sub.dxf.start, sub.dxf.end
+                            self._add("LINE", [(s2.x*sc, s2.y*sc), (e2.x*sc, e2.y*sc)], sl)
+                        elif st == "LWPOLYLINE":
+                            pts = [(p[0]*sc, p[1]*sc) for p in sub.get_points()]
+                            if pts:
+                                self._add("LWPOLYLINE", pts, sl)
+                except:
+                    pass
 
-    def _parse_entities(self, container):
+    def _parse_entities(self, container, ins_hint):
         raw_xs = []
         for ent in container:
             if ent.dxftype() == "LWPOLYLINE":
                 for p in ent.get_points():
                     raw_xs.append(p[0])
+        
         sc = 0.1 if (raw_xs and max(raw_xs) > 20) else 1.0
         self.scale = sc
+        
         for ent in container:
             t = ent.dxftype()
             lay = str(getattr(ent.dxf, "layer", "1"))
+            
             if t == "LINE":
                 s, e = ent.dxf.start, ent.dxf.end
                 self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay)
             elif t == "LWPOLYLINE":
                 pts = [(p[0]*sc, p[1]*sc) for p in ent.get_points()]
+                if ent.closed and pts and pts[0] != pts[-1]:
+                    pts.append(pts[0])
                 if pts:
                     self._add("LWPOLYLINE", pts, lay)
+            elif t == "ARC":
+                pts = self._arc_pts(ent, sc)
+                if pts:
+                    self._add("ARC", pts, lay)
+            elif t == "CIRCLE":
+                cx, cy = ent.dxf.center.x*sc, ent.dxf.center.y*sc
+                r = ent.dxf.radius*sc
+                self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
+            elif t == "SPLINE":
+                try:
+                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.5)]
+                    if pts:
+                        self._add("SPLINE", pts, lay)
+                except:
+                    pass
+            elif t in ("TEXT", "MTEXT"):
+                try:
+                    pos = ent.dxf.insert
+                    txt = ent.dxf.text if t == "TEXT" else ent.plain_mtext()
+                    txt = txt.strip()
+                    px, py = pos.x*sc, pos.y*sc
+                    if txt:
+                        h = max(getattr(ent.dxf, "height", 3)*sc, 0.2)
+                        self.entities.append({
+                            "type": "TEXT", "points": [(px, py)],
+                            "text": txt, "height": h, "layer": lay,
+                            "color": LAYER_COLORS.get(lay, DEFAULT_COLOR)
+                        })
+                except:
+                    pass
 
     def attach_rul(self, rul):
         self.rul_parser = rul
@@ -477,10 +549,11 @@ class PreviewRenderer:
         return img
 
 # ═══════════════════════════════════════════════
-# EXPORTERS
+# EXPORTERS - Shape Preservation
 # ═══════════════════════════════════════════════
 class PDFExporter:
     MARGIN = 1.5
+    
     def export(self, parser, out_path):
         if not parser.bounds:
             raise RuntimeError("No geometry")
@@ -493,10 +566,12 @@ class PDFExporter:
         
         c = pdf_canvas.Canvas(out_path, pagesize=(pw, ph))
         c.setTitle("DXF Pattern - All Sizes")
+        c.setSubject("Do Not Scale - Actual Size 1:1")
         
         def px(x): return (x+ox)*cm
         def py(y): return (y+oy)*cm
         
+        # Draw ALL graded sizes
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             for si, sname in enumerate(sizes):
@@ -523,6 +598,7 @@ class PDFExporter:
                     c.setFont("Helvetica-Bold", 8)
                     c.drawString(px(lx), py(ly), f"Size: {sname}")
         
+        # Draw ALL other entities (sew, grain, notches, etc.)
         for ent in parser.entities:
             lay = ent.get("layer", "1")
             if lay == "7":
@@ -561,7 +637,6 @@ class AIExporter:
         
         tmp_path = out_path.replace(".ai", "_tmp.pdf")
         c = pdf_canvas.Canvas(tmp_path, pagesize=(pw, ph))
-        c.setTitle("DXF Pattern")
         
         def px(x): return (x+ox)*cm
         def py(y): return (y+oy)*cm
@@ -773,6 +848,7 @@ class SVGExporter:
             f'<svg xmlns="http://www.w3.org/2000/svg"',
             f'    width="{svg_w:.3f}mm" height="{svg_h:.3f}mm"',
             f'    viewBox="0 0 {svg_w:.3f} {svg_h:.3f}">',
+            f'  <!-- Flaremo DXF Converter {VERSION} - Actual Size 1:1 -->',
             ''
         ]
         
@@ -805,6 +881,7 @@ class SVGExporter:
             lines.append(f'  </g>')
             lines.append('')
         
+        # Export ALL entities (sew, grain, notches, position marks, etc.)
         entity_lines = []
         for ent in parser.entities:
             lay = ent.get("layer", "1")
