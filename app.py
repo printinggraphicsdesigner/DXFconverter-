@@ -1,5 +1,6 @@
 """
 Flaremo DXF Converter - Flask Web API
+For deployment on Render
 """
 VERSION = "v2.0"
 from flask import Flask, request, jsonify, send_file
@@ -18,8 +19,8 @@ from ezdxf import recover as dxf_recover
 from PIL import Image, ImageDraw
 
 app = Flask(__name__)
-CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+CORS(app)  # Enable CORS for cross-origin requests
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max upload
 
 UPLOAD_FOLDER = tempfile.mkdtemp()
 OUTPUT_FOLDER = tempfile.mkdtemp()
@@ -35,11 +36,6 @@ LAYER_COLORS = {
     "7": (50, 50, 80),
 }
 DEFAULT_COLOR = (79, 142, 247)
-
-GRADE_COLORS = [
-    (255, 80, 80), (255, 165, 40), (230, 230, 50),
-    (255, 255, 255), (80, 210, 80), (60, 160, 255), (200, 80, 255),
-]
 
 # Session storage
 active_parser = {}
@@ -82,17 +78,10 @@ class AAMAParser:
         self.bounds = None
         self.scale = 0.1
         self.metadata = {}
-        self.grade_indices = []
-        self.rul_parser = None
-        self.graded_polys = {}
-        self._base_cut_polys = []
 
     def parse(self, filepath):
         self.entities = []
         self.metadata = {}
-        self.grade_indices = []
-        self.graded_polys = {}
-        self._base_cut_polys = []
 
         try:
             doc, _ = dxf_recover.readfile(filepath)
@@ -139,15 +128,11 @@ class AAMAParser:
                 pts = [(v.dxf.location.x*sc, v.dxf.location.y*sc) for v in verts]
                 if pts:
                     self._add("POLYLINE", pts, lay)
-                    if lay == "1":
-                        self._base_cut_polys.append(pts)
 
             elif t == "LWPOLYLINE":
                 pts = [(p[0]*sc, p[1]*sc) for p in ent.get_points()]
                 if pts:
                     self._add("LWPOLYLINE", pts, lay)
-                    if lay == "1" and not self._base_cut_polys:
-                        self._base_cut_polys.append(pts)
 
             elif t == "LINE":
                 s, e = ent.dxf.start, ent.dxf.end
