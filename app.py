@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════╗
 ║   Flaremo DXF Converter - Flask Web API                  ║
 ║   AAMA/ASTM DXF + RUL — Full Grading Support             ║
-║   Arc-length proportional interpolation                  ║
+║   With Size Labels on All Patterns                       ║
 ╚══════════════════════════════════════════════════════════╝
 """
 VERSION = "v2.0"
@@ -25,7 +25,7 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
 # ═══════════════════════════════════════════════
-# COLORS
+# COLORS - Expanded for more sizes
 # ═══════════════════════════════════════════════
 LAYER_COLORS = {
     "1": (255, 255, 255), "14": (100, 220, 100), "8": (255, 200, 60),
@@ -33,12 +33,22 @@ LAYER_COLORS = {
     "13": (200, 150, 255),
 }
 DEFAULT_COLOR = (79, 142, 247)
+
+# Expanded grade colors for up to 20 sizes
 GRADE_COLORS = [
-    (255, 80, 80), (255, 165, 40), (230, 230, 50),
-    (255, 255, 255), (80, 210, 80), (60, 160, 255), (200, 80, 255),
+    (255, 80, 80), (255, 165, 40), (230, 230, 50), (255, 255, 255),
+    (80, 210, 80), (60, 160, 255), (200, 80, 255), (255, 100, 180),
+    (100, 255, 200), (255, 200, 100), (180, 100, 255), (100, 200, 255),
+    (255, 150, 150), (150, 255, 150), (150, 150, 255), (255, 255, 150),
+    (255, 150, 255), (150, 255, 255), (200, 200, 200), (100, 100, 100),
 ]
-GRADE_COLORS_HEX = ["#FF5050", "#FFA528", "#C8C800", "#000000",
-                   "#28B428", "#1E90FF", "#A028FF"]
+
+GRADE_COLORS_HEX = [
+    "#FF5050", "#FFA528", "#E6E632", "#FFFFFF", "#50D250",
+    "#3CA0FF", "#C850FF", "#FF64B4", "#64FFC8", "#FFC864",
+    "#B464FF", "#64C8FF", "#FF9696", "#96FF96", "#9696FF",
+    "#FFFF96", "#FF96FF", "#96FFFF", "#C8C8C8", "#646464",
+]
 
 active_parser = {}
 
@@ -81,7 +91,7 @@ class RULParser:
         return (0.0, 0.0)
 
 # ═══════════════════════════════════════════════
-# GRADING ENGINE - Arc-length Interpolation
+# GRADING ENGINE
 # ═══════════════════════════════════════════════
 def _arc_length(pts, i1, i2):
     total = 0.0
@@ -367,7 +377,7 @@ class AAMAParser:
                 for i in range(steps+1)]
 
 # ═══════════════════════════════════════════════
-# PREVIEW RENDERER
+# PREVIEW RENDERER - With Size Labels
 # ═══════════════════════════════════════════════
 class PreviewRenderer:
     BG = (13, 15, 20)
@@ -400,13 +410,11 @@ class PreviewRenderer:
         def tx(x): return cx + (x-mxc)*scale
         def ty(y): return cy - (y-myc)*scale
         
-        # Draw ALL graded sizes
+        # Draw ALL graded sizes WITH LABELS
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             sample = parser.rul_parser.sample
             for si, sname in enumerate(sizes):
-                if sname == sample:
-                    continue
                 polys = parser.graded_polys.get(sname, [])
                 col = GRADE_COLORS[si % len(GRADE_COLORS)]
                 for poly_pts in polys:
@@ -418,7 +426,19 @@ class PreviewRenderer:
                         x2, y2 = sc2[i+1]
                         if RULER <= x1 <= cw and RULER <= y1 <= ch and \
                            RULER <= x2 <= cw and RULER <= y2 <= ch:
-                            draw.line([(x1, y1), (x2, y2)], fill=col, width=1)
+                            draw.line([(x1, y1), (x2, y2)], fill=col, width=2 if sname==sample else 1)
+                    
+                    # SIZE LABEL - Bottom-left of each pattern
+                    gxs = [p[0] for p in poly_pts]
+                    gys = [p[1] for p in poly_pts]
+                    lx = min(gxs)
+                    ly = min(gys) - 0.5
+                    label_x = int(tx(lx))
+                    label_y = int(ty(ly))
+                    if RULER <= label_x <= cw and RULER <= label_y <= ch:
+                        # Draw text background
+                        draw.rectangle([label_x-2, label_y-12, label_x+50, label_y+2], fill=(0,0,0))
+                        draw.text((label_x, label_y-10), f"Size: {sname}", fill=col, font_size=10)
         
         # Draw base entities
         for ent in parser.entities:
@@ -443,22 +463,23 @@ class PreviewRenderer:
                   f"  {w_cm}x{h_cm}cm  zoom{zoom:.1f}x  sizes:{n_sz}",
                   fill=(110, 140, 200))
         
-        # Legend
+        # Legend - Show all sizes
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             sample = parser.rul_parser.sample
-            lx = cw-78
+            lx = cw-90
             draw.text((lx, 6), "Sizes: ", fill=(110, 140, 200))
-            for si, sn in enumerate(sizes):
+            for si, sn in enumerate(sizes[:10]):  # Show first 10 in legend
                 col = GRADE_COLORS[si % len(GRADE_COLORS)]
                 ly = 18+si*13
                 draw.rectangle([lx, ly, lx+10, ly+9], fill=col)
-                draw.text((lx+14, ly), f"{'►' if sn==sample else ' '}{sn}", fill=col)
+                marker = '►' if sn==sample else ' '
+                draw.text((lx+14, ly), f"{marker}{sn}", fill=col, font_size=10)
         
         return img
 
 # ═══════════════════════════════════════════════
-# EXPORTERS
+# PDF EXPORTER - With Size Labels
 # ═══════════════════════════════════════════════
 class PDFExporter:
     MARGIN = 1.5
@@ -473,33 +494,40 @@ class PDFExporter:
         ph = (b[3]-b[1]+2*pad)*cm
         
         c = pdf_canvas.Canvas(out_path, pagesize=(pw, ph))
-        c.setTitle("DXF Pattern")
+        c.setTitle("DXF Pattern - All Sizes")
         
         def px(x): return (x+ox)*cm
         def py(y): return (y+oy)*cm
         
+        # Draw ALL graded sizes WITH LABELS
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             for si, sname in enumerate(sizes):
                 polys = parser.graded_polys.get(sname, [])
                 col = GRADE_COLORS[si % len(GRADE_COLORS)]
-                c.setLineWidth(0.5 if sname == parser.rul_parser.sample else 0.25)
+                c.setLineWidth(0.5 if sname == parser.rul_parser.sample else 0.3)
                 c.setStrokeColorRGB(col[0]/255, col[1]/255, col[2]/255)
+                c.setFillColorRGB(col[0]/255, col[1]/255, col[2]/255)
+                
                 for poly_pts in polys:
                     if len(poly_pts) < 2:
                         continue
+                    # Draw pattern outline
                     p = c.beginPath()
                     p.moveTo(px(poly_pts[0][0]), py(poly_pts[0][1]))
                     for pt in poly_pts[1:]:
                         p.lineTo(px(pt[0]), py(pt[1]))
                     c.drawPath(p, stroke=1, fill=0)
+                    
+                    # SIZE LABEL - Bottom-left of each pattern
                     gxs = [pt[0] for pt in poly_pts]
                     gys = [pt[1] for pt in poly_pts]
                     lx = min(gxs)
                     ly = min(gys) - 0.7
-                    c.setFont("Helvetica-Bold", 7)
+                    c.setFont("Helvetica-Bold", 8)
                     c.drawString(px(lx), py(ly), f"Size: {sname}")
         
+        # Draw other entities
         for ent in parser.entities:
             lay = ent.get("layer", "1")
             if lay == "7":
@@ -518,10 +546,20 @@ class PDFExporter:
         c.showPage()
         c.save()
 
+# ═══════════════════════════════════════════════
+# AI EXPORTER - With OCG Layers for ALL Sizes
+# ═══════════════════════════════════════════════
 class AIExporter:
     def export(self, parser, out_path):
         if not parser.bounds:
             raise RuntimeError("No geometry")
+        
+        if parser.graded_polys and parser.rul_parser:
+            self._export_ai_ocg(parser, out_path)
+        else:
+            self._export_ai_flat(parser, out_path)
+    
+    def _export_ai_flat(self, parser, out_path):
         b = parser.bounds
         pad = 1.5
         ox = -b[0]+pad
@@ -535,22 +573,6 @@ class AIExporter:
         
         def px(x): return (x+ox)*cm
         def py(y): return (y+oy)*cm
-        
-        if parser.graded_polys and parser.rul_parser:
-            sizes = parser.rul_parser.sizes
-            for si, sname in enumerate(sizes):
-                polys = parser.graded_polys.get(sname, [])
-                col = GRADE_COLORS[si % len(GRADE_COLORS)]
-                c.setLineWidth(0.5)
-                c.setStrokeColorRGB(col[0]/255, col[1]/255, col[2]/255)
-                for poly_pts in polys:
-                    if len(poly_pts) < 2:
-                        continue
-                    p = c.beginPath()
-                    p.moveTo(px(poly_pts[0][0]), py(poly_pts[0][1]))
-                    for pt in poly_pts[1:]:
-                        p.lineTo(px(pt[0]), py(pt[1]))
-                    c.drawPath(p, stroke=1, fill=0)
         
         for ent in parser.entities:
             pts = ent["points"]
@@ -576,23 +598,177 @@ class AIExporter:
             f.write(ai_prefix)
             f.write(pdf_data)
         os.remove(tmp_path)
+    
+    def _export_ai_ocg(self, parser, out_path):
+        try:
+            from pikepdf import Pdf, Dictionary, Array, Name, Stream, Page
+        except:
+            # Fallback if pikepdf not available
+            self._export_ai_flat(parser, out_path)
+            return
+        
+        b = parser.bounds
+        pad = 1.5
+        ox = -b[0]+pad
+        oy = -b[1]+pad
+        pw = (b[2]-b[0]+2*pad)*cm
+        ph = (b[3]-b[1]+2*pad)*cm
+        
+        pdf = Pdf.new()
+        
+        font_res = Dictionary(
+            HelvBd=Dictionary(Type=Name.Font, Subtype=Name.Type1,
+                              BaseFont=Name("/Helvetica-Bold"))
+        )
+        
+        form_xobjects = {}
+        ocgs = {}
+        
+        # Create layer for EACH size
+        sizes = parser.rul_parser.sizes
+        for si, sname in enumerate(sizes):
+            polys = parser.graded_polys.get(sname, [])
+            col = GRADE_COLORS[si % len(GRADE_COLORS)]
+            r, g, b2 = col[0]/255, col[1]/255, col[2]/255
+            
+            content = f"{r:.3f} {g:.3f} {b2:.3f} RG\n"
+            content += f"{r:.3f} {g:.3f} {b2:.3f} rg\n"
+            content += "0.5 w\n"
+            
+            for poly_pts in polys:
+                if len(poly_pts) < 2:
+                    continue
+                content += f"{(poly_pts[0][0]+ox)*cm:.3f} {(poly_pts[0][1]+oy)*cm:.3f} m\n"
+                for pt in poly_pts[1:]:
+                    content += f"{(pt[0]+ox)*cm:.3f} {(pt[1]+oy)*cm:.3f} l\n"
+                content += "S\n"
+                
+                # SIZE LABEL inside the layer
+                gxs = [p[0] for p in poly_pts]
+                gys = [p[1] for p in poly_pts]
+                lx = min(gxs)
+                ly = min(gys) - 0.7
+                safe = f"Size: {sname}".replace('(', '\\(').replace(')', '\\)')
+                content += f"BT\n/HelvBd 8 Tf\n"
+                content += f"{(lx+ox)*cm:.3f} {(ly+oy)*cm:.3f} Td\n"
+                content += f"({safe}) Tj\nET\n"
+            
+            form = pdf.make_indirect(Stream(
+                pdf, content.encode(),
+                **{
+                    "/Type": Name.XObject,
+                    "/Subtype": Name.Form,
+                    "/BBox": Array([0, 0, pw, ph]),
+                    "/Resources": Dictionary(Font=font_res)
+                }
+            ))
+            form_xobjects[sname] = form
+            ocgs[sname] = pdf.make_indirect(
+                Dictionary(Type=Name.OCG, Name=f"Size {sname}"))
+        
+        # Add other lines (sew, grain) in separate layer
+        other_content = "0 0 0 RG\n0 0 0 rg\n0.25 w\n"
+        has_other = False
+        for ent in parser.entities:
+            lay = ent.get("layer", "1")
+            if lay in ("7", "1"):
+                continue
+            pts = ent["points"]
+            if len(pts) < 2:
+                continue
+            has_other = True
+            other_content += f"{(pts[0][0]+ox)*cm:.3f} {(pts[0][1]+oy)*cm:.3f} m\n"
+            for pt in pts[1:]:
+                other_content += f"{(pt[0]+ox)*cm:.3f} {(pt[1]+oy)*cm:.3f} l\n"
+            other_content += "S\n"
+        
+        other_form = None
+        other_ocg = None
+        if has_other:
+            other_form = pdf.make_indirect(Stream(
+                pdf, other_content.encode(),
+                **{"/Type": Name.XObject, "/Subtype": Name.Form,
+                   "/BBox": Array([0, 0, pw, ph]), "/Resources": Dictionary()}
+            ))
+            other_ocg = pdf.make_indirect(
+                Dictionary(Type=Name.OCG, Name="Sew/Grain Lines"))
+        
+        # Build page content
+        page_content = ""
+        xobj_names = {}
+        for sname in sizes:
+            pk = f"OC{sname.replace('-','').replace(' ','')}"
+            xkey = f"XO{sname.replace('-','').replace(' ','')}"
+            xobj_names[sname] = xkey
+            page_content += f"/OC /{pk} BDC\n/{xkey} Do\nEMC\n"
+        if has_other:
+            page_content += "/OC /OCOther BDC\n/XOOther Do\nEMC\n"
+        
+        xobj_dict = {xobj_names[s]: form_xobjects[s] for s in sizes}
+        props_dict = {f"OC{s.replace('-','').replace(' ','')}": ocgs[s] for s in sizes}
+        if has_other:
+            xobj_dict["XOOther"] = other_form
+            props_dict["OCOther"] = other_ocg
+        
+        resources = Dictionary(
+            XObject=Dictionary(**xobj_dict),
+            Properties=Dictionary(**props_dict),
+            Font=font_res
+        )
+        
+        cs = Stream(pdf, page_content.encode())
+        page_obj = pdf.make_indirect(Dictionary(
+            Type=Name.Page, MediaBox=Array([0, 0, pw, ph]),
+            Contents=pdf.make_indirect(cs), Resources=resources))
+        pdf.pages.append(Page(page_obj))
+        
+        ocg_list = [ocgs[s] for s in sizes]
+        if has_other:
+            ocg_list.append(other_ocg)
+        pdf.Root.OCProperties = Dictionary(
+            OCGs=Array(ocg_list),
+            D=Dictionary(Name="Grading Sizes", Order=Array(ocg_list),
+                         ON=Array(ocg_list), BaseState=Name.ON))
+        pdf.trailer.Info = pdf.make_indirect(Dictionary(
+            Title="DXF Pattern - All Sizes with Labels",
+            Creator=f"Flaremo DXF Converter {VERSION}"))
+        
+        tmp = out_path.replace(".ai", "__ocg__.pdf")
+        pdf.save(tmp)
+        with open(tmp, "rb") as f:
+            pdf_data = f.read()
+        ai_prefix = (b"%!PS-Adobe-3.0\n"
+                     b"%%Creator: Adobe Illustrator 26.0\n"
+                     b"%%Title: Pattern_Graded_Layers\n%%EndComments\n")
+        with open(out_path, "wb") as f:
+            f.write(ai_prefix)
+            f.write(pdf_data)
+        os.remove(tmp)
 
+# ═══════════════════════════════════════════════
+# SVG EXPORTER - With Size Labels
+# ═══════════════════════════════════════════════
 class SVGExporter:
     PAD = 15.0
     def export(self, parser, out_path):
         if not parser.bounds:
             raise RuntimeError("No geometry")
         
-        all_pts = []
         if parser.graded_polys and parser.rul_parser:
+            self._export_graded(parser, out_path)
+        else:
+            self._export_base(parser, out_path)
+    
+    def _export_graded(self, parser, out_path):
+        rul = parser.rul_parser
+        sizes = rul.sizes
+        
+        all_pts = []
+        if parser.graded_polys:
             for polys in parser.graded_polys.values():
                 for poly in polys:
                     for p in poly:
                         all_pts.append((p[0]*10, p[1]*10))
-        else:
-            for e in parser.entities:
-                for p in e["points"]:
-                    all_pts.append((p[0]*10, p[1]*10))
         
         if not all_pts:
             raise RuntimeError("No geometry")
@@ -617,37 +793,87 @@ class SVGExporter:
             ''
         ]
         
-        if parser.graded_polys and parser.rul_parser:
-            sizes = parser.rul_parser.sizes
-            for si, sname in enumerate(sizes):
-                polys = parser.graded_polys.get(sname, [])
-                col = GRADE_COLORS_HEX[si % len(GRADE_COLORS_HEX)]
-                sw = "0.5" if sname == parser.rul_parser.sample else "0.3"
-                lines.append(f'  <g id="Size_{sname}">')
-                for poly in polys:
-                    if len(poly) < 2:
-                        continue
-                    d = f"M {sx(poly[0][0]*10)},{sy(poly[0][1]*10)}"
-                    for pt in poly[1:]:
-                        d += f" L {sx(pt[0]*10)},{sy(pt[1]*10)}"
-                    lines.append(f'    <path d="{d}" fill="none" stroke="{col}" stroke-width="{sw}"/>')
-                lines.append(f'  </g>')
-        else:
-            lines.append('  <g id="Base">')
-            for ent in parser.entities:
-                pts = ent["points"]
-                if len(pts) < 2:
+        for si, sname in enumerate(sizes):
+            polys = parser.graded_polys.get(sname, [])
+            col = GRADE_COLORS_HEX[si % len(GRADE_COLORS_HEX)]
+            sw = "0.5" if sname == parser.rul_parser.sample else "0.3"
+            
+            lines.append(f'  <!-- Size {sname} -->')
+            lines.append(f'  <g id="Size_{sname}">')
+            
+            for poly in polys:
+                if len(poly) < 2:
                     continue
-                d = f"M {sx(pts[0][0]*10)},{sy(pts[0][1]*10)}"
-                for pt in pts[1:]:
+                d = f"M {sx(poly[0][0]*10)},{sy(poly[0][1]*10)}"
+                for pt in poly[1:]:
                     d += f" L {sx(pt[0]*10)},{sy(pt[1]*10)}"
-                lines.append(f'    <path d="{d}" fill="none" stroke="#000" stroke-width="0.5"/>')
-            lines.append('  </g>')
+                lines.append(f'    <path d="{d}" fill="none" stroke="{col}" stroke-width="{sw}"/>')
+                
+                # SIZE LABEL
+                gxs = [p[0] for p in poly]
+                gys = [p[1] for p in poly]
+                lx = min(gxs)
+                ly = min(gys) - 7
+                lines.append(f'    <text x="{sx(lx*10)}" y="{sy(ly*10)}"')
+                lines.append(f'          font-family="Helvetica,Arial,sans-serif"')
+                lines.append(f'          font-weight="bold" font-size="8" fill="{col}">')
+                lines.append(f'      Size: {sname}')
+                lines.append(f'    </text>')
+            
+            lines.append(f'  </g>')
+            lines.append('')
+        
+        lines.append('</svg>')
+        
+        with open(out_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+    
+    def _export_base(self, parser, out_path):
+        all_pts = []
+        for e in parser.entities:
+            for p in e["points"]:
+                all_pts.append((p[0]*10, p[1]*10))
+        if not all_pts:
+            raise RuntimeError("No geometry")
+        
+        xs = [p[0] for p in all_pts]
+        ys = [p[1] for p in all_pts]
+        b = (min(xs), min(ys), max(xs), max(ys))
+        pad = self.PAD
+        x_off = -b[0]+pad
+        y_off = -b[1]+pad
+        svg_w = (b[2]-b[0])+2*pad
+        svg_h = (b[3]-b[1])+2*pad
+        
+        def sx(x): return round(x+x_off, 3)
+        def sy(y): return round(svg_h-(y+y_off), 3)
+        
+        lines = [
+            '<?xml version="1.0" encoding="UTF-8"?>',
+            f'<svg xmlns="http://www.w3.org/2000/svg"',
+            f'    width="{svg_w:.3f}mm" height="{svg_h:.3f}mm"',
+            f'    viewBox="0 0 {svg_w:.3f} {svg_h:.3f}">',
+            '  <g id="Base">',
+        ]
+        
+        for ent in parser.entities:
+            pts = ent["points"]
+            if len(pts) < 2:
+                continue
+            d = f"M {sx(pts[0][0]*10)},{sy(pts[0][1]*10)}"
+            for pt in pts[1:]:
+                d += f" L {sx(pt[0]*10)},{sy(pt[1]*10)}"
+            lines.append(f'    <path d="{d}" fill="none" stroke="#000" stroke-width="0.5"/>')
+        
+        lines.append('  </g>')
         lines.append('</svg>')
         
         with open(out_path, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
+# ═══════════════════════════════════════════════
+# DXF SAVER
+# ═══════════════════════════════════════════════
 class DXFSaver:
     def save(self, parser, out_path):
         doc = ezdxf.new("R2010")
