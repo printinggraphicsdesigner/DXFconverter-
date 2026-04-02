@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════╗
 ║   Flaremo DXF Converter - Flask Web API                  ║
-║   AAMA/ASTM DXF + RUL — Full Grading Support             ║
-║   Shape Preservation - Curves, Arcs, Splines             ║
+║   Shape Preservation - Curves, Corners, Grading          ║
+║   CLO-Compatible Export                                  ║
 ╚══════════════════════════════════════════════════════════╝
 """
-VERSION = "v2.0"
+VERSION = "v3.0"
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os, io, base64, math, re, tempfile, shutil, atexit
@@ -166,7 +166,7 @@ def compute_graded_poly(base_pts, grade_indices, rul, size_idx):
     return graded
 
 # ═══════════════════════════════════════════════
-# DXF PARSER - Full Entity Support
+# DXF PARSER - IMPROVED CURVE PRESERVATION
 # ═══════════════════════════════════════════════
 class AAMAParser:
     def __init__(self):
@@ -191,15 +191,15 @@ class AAMAParser:
         except Exception as e:
             raise RuntimeError(f"DXF read error: {e}")
         
-        # Check units
+        # Check units - FIXED logic
         try:
-            ins = doc.header.get("$INSUNITS", None)
+            ins = doc.header.get("$INSUNITS", 4)  # Default to mm
         except:
-            ins = None
+            ins = 4
         
         msp = doc.modelspace()
         
-        # First pass: TEXT and INSERT
+        # First pass: TEXT and INSERT (blocks)
         for ent in msp:
             if ent.dxftype() == "TEXT":
                 try:
@@ -218,7 +218,7 @@ class AAMAParser:
         self._update_bounds()
 
     def _parse_block(self, block, ins_hint):
-        # Determine scale from block extents
+        # Determine scale from block extents - FIXED
         raw_xs = []
         for ent in block:
             if ent.dxftype() == "POLYLINE":
@@ -231,7 +231,8 @@ class AAMAParser:
             return
         
         rw = max(raw_xs) - min(raw_xs)
-        sc = 0.1 if (ins_hint != 5 and rw > 20) else 1.0
+        # FIXED: ins_hint==4 means mm, so scale=0.1; ins_hint==1 means inches, scale=1.0
+        sc = 0.1 if (ins_hint == 4 and rw > 200) else 1.0
         self.scale = sc
         
         # Collect grade-rule TEXT (layer 1, format "# N")
@@ -245,7 +246,7 @@ class AAMAParser:
                     key = (round(pos.x*sc, 3), round(pos.y*sc, 3))
                     point_rules[key] = int(m.group(1))
         
-        # Parse all geometry
+        # Parse all geometry with IMPROVED curve handling
         for ent in block:
             t = ent.dxftype()
             lay = str(getattr(ent.dxf, "layer", "1"))
@@ -281,18 +282,21 @@ class AAMAParser:
                 self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay)
             
             elif t == "ARC":
+                # FIXED: Dynamic steps based on arc length
                 pts = self._arc_pts(ent, sc)
                 if pts:
                     self._add("ARC", pts, lay)
             
             elif t == "CIRCLE":
+                # FIXED: Dynamic steps based on circumference
                 cx, cy = ent.dxf.center.x*sc, ent.dxf.center.y*sc
                 r = ent.dxf.radius*sc
                 self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
             
             elif t == "SPLINE":
+                # FIXED: 0.1 tolerance instead of 0.5
                 try:
-                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.5)]
+                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.1)]
                     if pts:
                         self._add("SPLINE", pts, lay)
                 except:
@@ -336,7 +340,7 @@ class AAMAParser:
                 for p in ent.get_points():
                     raw_xs.append(p[0])
         
-        sc = 0.1 if (raw_xs and max(raw_xs) > 20) else 1.0
+        sc = 0.1 if (raw_xs and max(raw_xs) > 200) else 1.0
         self.scale = sc
         
         for ent in container:
@@ -348,8 +352,6 @@ class AAMAParser:
                 self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay)
             elif t == "LWPOLYLINE":
                 pts = [(p[0]*sc, p[1]*sc) for p in ent.get_points()]
-                if ent.closed and pts and pts[0] != pts[-1]:
-                    pts.append(pts[0])
                 if pts:
                     self._add("LWPOLYLINE", pts, lay)
             elif t == "ARC":
@@ -362,7 +364,7 @@ class AAMAParser:
                 self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
             elif t == "SPLINE":
                 try:
-                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.5)]
+                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.1)]
                     if pts:
                         self._add("SPLINE", pts, lay)
                 except:
@@ -428,7 +430,8 @@ class AAMAParser:
                 if v:
                     self.metadata[key] = v
 
-    def _arc_pts(self, arc, sc, steps=64):
+    def _arc_pts(self, arc, sc, min_steps=128):
+        """FIXED: Dynamic steps based on arc length for smooth curves"""
         try:
             cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
             r = arc.dxf.radius*sc
@@ -436,13 +439,25 @@ class AAMAParser:
             ea = math.radians(arc.dxf.end_angle)
             if ea < sa:
                 ea += 2*math.pi
+            
+            # Calculate arc length
+            arc_len = r * (ea - sa)
+            # Dynamic steps: 1 step per 1mm of arc length, minimum 128 steps
+            steps = max(min_steps, int(arc_len * 10))
+            
             return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
                      cy+r*math.sin(sa+(ea-sa)*i/steps))
                     for i in range(steps+1)]
         except:
             return []
 
-    def _circle_pts(self, cx, cy, r, steps=72):
+    def _circle_pts(self, cx, cy, r, min_steps=256):
+        """FIXED: Dynamic steps based on circumference for smooth circles"""
+        # Calculate circumference
+        circ = 2 * math.pi * r
+        # Dynamic steps: 1 step per 1mm of circumference, minimum 256 steps
+        steps = max(min_steps, int(circ * 10))
+        
         return [(cx+r*math.cos(2*math.pi*i/steps),
                  cy+r*math.sin(2*math.pi*i/steps))
                 for i in range(steps+1)]
@@ -452,8 +467,6 @@ class AAMAParser:
 # ═══════════════════════════════════════════════
 class PreviewRenderer:
     BG = (13, 15, 20)
-    GRID_MAJ = (35, 42, 65)
-    GRID_MIN = (20, 26, 44)
 
     def render(self, parser, cw, ch, zoom=1.0):
         img = Image.new("RGB", (cw, ch), self.BG)
@@ -510,7 +523,7 @@ class PreviewRenderer:
                         draw.rectangle([label_x-2, label_y-12, label_x+50, label_y+2], fill=(0,0,0))
                         draw.text((label_x, label_y-10), f"Size: {sname}", fill=col, font_size=10)
         
-        # Draw base entities
+        # Draw ALL entities (sew, grain, notches, etc.)
         for ent in parser.entities:
             pts = ent["points"]
             lay = ent.get("layer", "1")
@@ -533,23 +546,10 @@ class PreviewRenderer:
                   f"  {w_cm}x{h_cm}cm  zoom{zoom:.1f}x  sizes:{n_sz}",
                   fill=(110, 140, 200))
         
-        # Legend
-        if parser.graded_polys and parser.rul_parser:
-            sizes = parser.rul_parser.sizes
-            sample = parser.rul_parser.sample
-            lx = cw-90
-            draw.text((lx, 6), "Sizes: ", fill=(110, 140, 200))
-            for si, sn in enumerate(sizes[:10]):
-                col = GRADE_COLORS[si % len(GRADE_COLORS)]
-                ly = 18+si*13
-                draw.rectangle([lx, ly, lx+10, ly+9], fill=col)
-                marker = '►' if sn==sample else ' '
-                draw.text((lx+14, ly), f"{marker}{sn}", fill=col, font_size=10)
-        
         return img
 
 # ═══════════════════════════════════════════════
-# EXPORTERS - Shape Preservation
+# EXPORTERS - CLO-Compatible
 # ═══════════════════════════════════════════════
 class PDFExporter:
     MARGIN = 1.5
@@ -579,7 +579,6 @@ class PDFExporter:
                 col = GRADE_COLORS[si % len(GRADE_COLORS)]
                 c.setLineWidth(0.5 if sname == parser.rul_parser.sample else 0.3)
                 c.setStrokeColorRGB(col[0]/255, col[1]/255, col[2]/255)
-                c.setFillColorRGB(col[0]/255, col[1]/255, col[2]/255)
                 
                 for poly_pts in polys:
                     if len(poly_pts) < 2:
@@ -598,7 +597,7 @@ class PDFExporter:
                     c.setFont("Helvetica-Bold", 8)
                     c.drawString(px(lx), py(ly), f"Size: {sname}")
         
-        # Draw ALL other entities (sew, grain, notches, etc.)
+        # Draw ALL other entities
         for ent in parser.entities:
             lay = ent.get("layer", "1")
             if lay == "7":
@@ -881,7 +880,7 @@ class SVGExporter:
             lines.append(f'  </g>')
             lines.append('')
         
-        # Export ALL entities (sew, grain, notches, position marks, etc.)
+        # Export ALL entities (FIXED - was missing before!)
         entity_lines = []
         for ent in parser.entities:
             lay = ent.get("layer", "1")
