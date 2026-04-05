@@ -271,12 +271,11 @@ class AAMAParser:
                         self._base_cut_polys.append(pts)
 
             elif t == "SPLINE":
-                try:
-                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.5)]
-                    if pts:
-                        self._add("SPLINE", pts, lay)
-                except:
-                    pass
+    try:
+        # FIXED: Use 0.01 tolerance instead of 0.5 for smooth curves
+        pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.01)]
+        if pts: self._add("SPLINE", pts, lay)
+    except: pass
 
             elif t == "LINE":
                 s, e = ent.dxf.start, ent.dxf.end
@@ -391,24 +390,37 @@ class AAMAParser:
                 if v:
                     self.metadata[key] = v
 
-    def _arc_pts(self, arc, sc, steps=64):
-        try:
-            cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
-            r = arc.dxf.radius*sc
-            sa = math.radians(arc.dxf.start_angle)
-            ea = math.radians(arc.dxf.end_angle)
-            if ea < sa:
-                ea += 2*math.pi
-            return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
-                     cy+r*math.sin(sa+(ea-sa)*i/steps))
-                    for i in range(steps+1)]
-        except:
-            return []
-
-    def _circle_pts(self, cx, cy, r, steps=72):
-        return [(cx+r*math.cos(2*math.pi*i/steps),
-                 cy+r*math.sin(2*math.pi*i/steps))
+   def _arc_pts(self, arc, sc, min_steps=128):
+    """Dynamic steps based on arc length for smooth curves"""
+    try:
+        cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
+        r = arc.dxf.radius*sc
+        sa = math.radians(arc.dxf.start_angle)
+        ea = math.radians(arc.dxf.end_angle)
+        if ea < sa:
+            ea += 2*math.pi
+        
+        # Calculate arc length in mm
+        arc_len_mm = r * (ea - sa) * 10  # cm → mm
+        # Dynamic steps: 1 step per 0.5mm, minimum 128
+        steps = max(min_steps, int(arc_len_mm * 2))
+        
+        return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
+                 cy+r*math.sin(sa+(ea-sa)*i/steps))
                 for i in range(steps+1)]
+    except:
+        return []
+
+def _circle_pts(self, cx, cy, r, min_steps=256):
+    """Dynamic steps based on circumference for smooth circles"""
+    # Calculate circumference in mm
+    circ_mm = 2 * math.pi * r * 10  # cm → mm
+    # Dynamic steps: 1 step per 0.5mm, minimum 256
+    steps = max(min_steps, int(circ_mm * 2))
+    
+    return [(cx+r*math.cos(2*math.pi*i/steps),
+             cy+r*math.sin(2*math.pi*i/steps))
+            for i in range(steps+1)]
 
 # ═══════════════════════════════════════════════
 # PREVIEW RENDERER (Desktop App Exact)
