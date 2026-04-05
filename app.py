@@ -1,11 +1,11 @@
 """
 ╔══════════════════════════════════════════════════════════╗
-║   Flaremo DXF Converter - Flask Web API                  ║
-║   Shape Preservation - Curves, Corners, Grading          ║
-║   CLO-Compatible Export                                  ║
+║   Flaremo DXF Converter - Lectra Modaris Compatible      ║
+║   Proper DXF Structure Handling (BLOCKS + INSERTS)       ║
+║   Preserves Original Coordinates & Multiple Pieces       ║
 ╚══════════════════════════════════════════════════════════╝
 """
-VERSION = "v3.0"
+VERSION = "v4.0"
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os, io, base64, math, re, tempfile, shutil, atexit
@@ -25,7 +25,7 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
 # ═══════════════════════════════════════════════
-# COLORS
+# COLORS (Lectra Modaris Standard)
 # ═══════════════════════════════════════════════
 LAYER_COLORS = {
     "1": (255, 255, 255), "14": (100, 220, 100), "8": (255, 200, 60),
@@ -36,17 +36,12 @@ DEFAULT_COLOR = (79, 142, 247)
 
 GRADE_COLORS = [
     (255, 80, 80), (255, 165, 40), (230, 230, 50), (255, 255, 255),
-    (80, 210, 80), (60, 160, 255), (200, 80, 255), (255, 100, 180),
-    (100, 255, 200), (255, 200, 100), (180, 100, 255), (100, 200, 255),
-    (255, 150, 150), (150, 255, 150), (150, 150, 255), (255, 255, 150),
-    (255, 150, 255), (150, 255, 255), (200, 200, 200), (100, 100, 100),
+    (80, 210, 80), (60, 160, 255), (200, 80, 255),
 ]
 
 GRADE_COLORS_HEX = [
     "#FF5050", "#FFA528", "#E6E632", "#FFFFFF", "#50D250",
-    "#3CA0FF", "#C850FF", "#FF64B4", "#64FFC8", "#FFC864",
-    "#B464FF", "#64C8FF", "#FF9696", "#96FF96", "#9696FF",
-    "#FFFF96", "#FF96FF", "#96FFFF", "#C8C8C8", "#646464",
+    "#3CA0FF", "#C850FF",
 ]
 
 active_parser = {}
@@ -90,7 +85,7 @@ class RULParser:
         return (0.0, 0.0)
 
 # ═══════════════════════════════════════════════
-# GRADING ENGINE - Arc-length Interpolation
+# GRADING ENGINE
 # ═══════════════════════════════════════════════
 def _arc_length(pts, i1, i2):
     total = 0.0
@@ -166,18 +161,20 @@ def compute_graded_poly(base_pts, grade_indices, rul, size_idx):
     return graded
 
 # ═══════════════════════════════════════════════
-# DXF PARSER - IMPROVED CURVE PRESERVATION
+# DXF PARSER - Lectra Modaris Compatible
 # ═══════════════════════════════════════════════
 class AAMAParser:
     def __init__(self):
         self.entities = []
         self.bounds = None
+        self.unit_name = "mm→cm"
         self.scale = 0.1
         self.metadata = {}
         self.grade_indices = []
         self.rul_parser = None
         self.graded_polys = {}
         self._base_cut_polys = []
+        self._piece_positions = []  # Store INSERT positions for multiple pieces
 
     def parse(self, filepath):
         self.entities = []
@@ -185,55 +182,66 @@ class AAMAParser:
         self.grade_indices = []
         self.graded_polys = {}
         self._base_cut_polys = []
+        self._piece_positions = []
         
         try:
             doc, _ = dxf_recover.readfile(filepath)
         except Exception as e:
-            raise RuntimeError(f"DXF read error: {e}")
-        
-        # Check units - FIXED logic
+            raise RuntimeError(f"DXF পড়তে পারছি না:\n{e}")
+
+        # Get proper scale from $INSUNITS
         try:
-            ins = doc.header.get("$INSUNITS", 4)  # Default to mm
+            ins = doc.header.get("$INSUNITS", 4)
         except:
             ins = 4
         
+        # Lectra Modaris scale logic
+        if ins == 1:      # inches
+            self.scale = 2.54
+        elif ins == 4:    # millimeters
+            self.scale = 0.1
+        elif ins == 5:    # centimeters
+            self.scale = 1.0
+        else:
+            self.scale = 0.1  # default to mm
+
         msp = doc.modelspace()
         
-        # First pass: TEXT and INSERT (blocks)
+        # FIRST: Parse all TEXT for metadata
         for ent in msp:
             if ent.dxftype() == "TEXT":
                 try:
                     self._parse_meta(ent.dxf.text.strip())
                 except:
                     pass
-            elif ent.dxftype() == "INSERT":
+        
+        # SECOND: Parse INSERT entities (each INSERT = one pattern piece)
+        # This is the KEY difference from Desktop App!
+        piece_index = 0
+        for ent in msp:
+            if ent.dxftype() == "INSERT":
                 block = doc.blocks.get(ent.dxf.name)
                 if block:
-                    self._parse_block(block, ins)
+                    # Get INSERT insertion point (THIS IS CRITICAL!)
+                    insert_point = ent.dxf.insert  # (x, y, z)
+                    self._piece_positions.append({
+                        'index': piece_index,
+                        'position': (insert_point.x, insert_point.y),
+                        'block_name': ent.dxf.name
+                    })
+                    self._parse_block(block, insert_point, piece_index)
+                    piece_index += 1
         
-        # Second pass: other entities (if no blocks found)
+        # THIRD: If no INSERT found, parse direct entities
         if not self.entities:
-            self._parse_entities(msp, ins)
-        
+            self._parse_entities(msp)
+
         self._update_bounds()
 
-    def _parse_block(self, block, ins_hint):
-        # Determine scale from block extents - FIXED
-        raw_xs = []
-        for ent in block:
-            if ent.dxftype() == "POLYLINE":
-                for v in ent.vertices:
-                    raw_xs.append(v.dxf.location.x)
-            elif ent.dxftype() == "LINE":
-                raw_xs += [ent.dxf.start.x, ent.dxf.end.x]
-        
-        if not raw_xs:
-            return
-        
-        rw = max(raw_xs) - min(raw_xs)
-        # FIXED: ins_hint==4 means mm, so scale=0.1; ins_hint==1 means inches, scale=1.0
-        sc = 0.1 if (ins_hint == 4 and rw > 200) else 1.0
-        self.scale = sc
+    def _parse_block(self, block, insert_point, piece_index):
+        """Parse a BLOCK with INSERT position applied (Lectra Modaris style)"""
+        sc = self.scale
+        ix, iy = insert_point.x * sc, insert_point.y * sc
         
         # Collect grade-rule TEXT (layer 1, format "# N")
         point_rules = {}
@@ -243,21 +251,25 @@ class AAMAParser:
                 m = re.match(r"^#\s*(\d+)$", txt)
                 if m and str(ent.dxf.layer) == "1":
                     pos = ent.dxf.insert
-                    key = (round(pos.x*sc, 3), round(pos.y*sc, 3))
+                    # Apply INSERT position offset
+                    key = (round((pos.x + insert_point.x) * sc, 3), 
+                           round((pos.y + insert_point.y) * sc, 3))
                     point_rules[key] = int(m.group(1))
-        
-        # Parse all geometry with IMPROVED curve handling
+
+        # Parse all geometry with INSERT position offset
         for ent in block:
             t = ent.dxftype()
             lay = str(getattr(ent.dxf, "layer", "1"))
-            
+
             if t == "POLYLINE":
                 verts = list(ent.vertices)
-                pts = [(v.dxf.location.x*sc, v.dxf.location.y*sc) for v in verts]
+                # Apply INSERT position offset to ALL points
+                pts = [((v.dxf.location.x + insert_point.x) * sc, 
+                        (v.dxf.location.y + insert_point.y) * sc) for v in verts]
                 if ent.is_closed and pts and pts[0] != pts[-1]:
                     pts.append(pts[0])
                 if pts:
-                    self._add("POLYLINE", pts, lay)
+                    self._add("POLYLINE", pts, lay, piece_index)
                     if lay == "1":
                         self._base_cut_polys.append(pts)
                         gi = []
@@ -267,73 +279,70 @@ class AAMAParser:
                                 gi.append((vi, point_rules[key]))
                         if gi and not self.grade_indices:
                             self.grade_indices = gi
-            
+
             elif t == "LWPOLYLINE":
-                pts = [(p[0]*sc, p[1]*sc) for p in ent.get_points()]
+                pts = [((p[0] + insert_point.x) * sc, 
+                        (p[1] + insert_point.y) * sc) for p in ent.get_points()]
                 if ent.closed and pts and pts[0] != pts[-1]:
                     pts.append(pts[0])
                 if pts:
-                    self._add("LWPOLYLINE", pts, lay)
+                    self._add("LWPOLYLINE", pts, lay, piece_index)
                     if lay == "1" and not self._base_cut_polys:
                         self._base_cut_polys.append(pts)
-            
-            elif t == "LINE":
-                s, e = ent.dxf.start, ent.dxf.end
-                self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay)
-            
-            elif t == "ARC":
-                # FIXED: Dynamic steps based on arc length
-                pts = self._arc_pts(ent, sc)
-                if pts:
-                    self._add("ARC", pts, lay)
-            
-            elif t == "CIRCLE":
-                # FIXED: Dynamic steps based on circumference
-                cx, cy = ent.dxf.center.x*sc, ent.dxf.center.y*sc
-                r = ent.dxf.radius*sc
-                self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
-            
+
             elif t == "SPLINE":
-                # FIXED: 0.1 tolerance instead of 0.5
+                # FIXED: Use 0.01 tolerance for smooth curves (Lectra standard)
                 try:
-                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.1)]
+                    pts = [((p[0] + insert_point.x) * sc, 
+                            (p[1] + insert_point.y) * sc) 
+                           for p in ent.flattening(0.01)]
                     if pts:
-                        self._add("SPLINE", pts, lay)
+                        self._add("SPLINE", pts, lay, piece_index)
                 except:
                     pass
-            
+
+            elif t == "LINE":
+                s, e = ent.dxf.start, ent.dxf.end
+                # Apply INSERT position offset
+                self._add("LINE", [
+                    ((s.x + insert_point.x) * sc, (s.y + insert_point.y) * sc),
+                    ((e.x + insert_point.x) * sc, (e.y + insert_point.y) * sc)
+                ], lay, piece_index)
+
+            elif t == "ARC":
+                # Dynamic steps based on arc length
+                pts = self._arc_pts(ent, sc, insert_point)
+                if pts:
+                    self._add("ARC", pts, lay, piece_index)
+
+            elif t == "CIRCLE":
+                cx = (ent.dxf.center.x + insert_point.x) * sc
+                cy = (ent.dxf.center.y + insert_point.y) * sc
+                r = ent.dxf.radius * sc
+                # Dynamic steps based on circumference
+                self._add("CIRCLE", self._circle_pts(cx, cy, r), lay, piece_index)
+
             elif t in ("TEXT", "MTEXT"):
                 try:
                     pos = ent.dxf.insert
                     txt = ent.dxf.text if t == "TEXT" else ent.plain_mtext()
                     txt = txt.strip()
-                    px, py = pos.x*sc, pos.y*sc
+                    # Apply INSERT position offset
+                    px = (pos.x + insert_point.x) * sc
+                    py = (pos.y + insert_point.y) * sc
                     if txt and not re.match(r"^#\s*\d+$", txt):
-                        h = max(getattr(ent.dxf, "height", 3)*sc, 0.2)
+                        h = max(getattr(ent.dxf, "height", 3) * sc, 0.2)
                         self.entities.append({
                             "type": "TEXT", "points": [(px, py)],
                             "text": txt, "height": h, "layer": lay,
-                            "color": LAYER_COLORS.get(lay, DEFAULT_COLOR)
+                            "color": LAYER_COLORS.get(lay, DEFAULT_COLOR),
+                            "piece_index": piece_index
                         })
                 except:
                     pass
-            
-            elif t == "INSERT":
-                try:
-                    for sub in ent.virtual_entities():
-                        sl = str(getattr(sub.dxf, "layer", "1"))
-                        st = sub.dxftype()
-                        if st == "LINE":
-                            s2, e2 = sub.dxf.start, sub.dxf.end
-                            self._add("LINE", [(s2.x*sc, s2.y*sc), (e2.x*sc, e2.y*sc)], sl)
-                        elif st == "LWPOLYLINE":
-                            pts = [(p[0]*sc, p[1]*sc) for p in sub.get_points()]
-                            if pts:
-                                self._add("LWPOLYLINE", pts, sl)
-                except:
-                    pass
 
-    def _parse_entities(self, container, ins_hint):
+    def _parse_entities(self, container):
+        """Fallback for DXF without blocks"""
         raw_xs = []
         for ent in container:
             if ent.dxftype() == "LWPOLYLINE":
@@ -346,42 +355,26 @@ class AAMAParser:
         for ent in container:
             t = ent.dxftype()
             lay = str(getattr(ent.dxf, "layer", "1"))
-            
             if t == "LINE":
                 s, e = ent.dxf.start, ent.dxf.end
-                self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay)
+                self._add("LINE", [(s.x*sc, s.y*sc), (e.x*sc, e.y*sc)], lay, 0)
             elif t == "LWPOLYLINE":
                 pts = [(p[0]*sc, p[1]*sc) for p in ent.get_points()]
                 if pts:
-                    self._add("LWPOLYLINE", pts, lay)
+                    self._add("LWPOLYLINE", pts, lay, 0)
             elif t == "ARC":
                 pts = self._arc_pts(ent, sc)
                 if pts:
-                    self._add("ARC", pts, lay)
+                    self._add("ARC", pts, lay, 0)
             elif t == "CIRCLE":
                 cx, cy = ent.dxf.center.x*sc, ent.dxf.center.y*sc
                 r = ent.dxf.radius*sc
-                self._add("CIRCLE", self._circle_pts(cx, cy, r), lay)
+                self._add("CIRCLE", self._circle_pts(cx, cy, r), lay, 0)
             elif t == "SPLINE":
                 try:
-                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.1)]
+                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.01)]
                     if pts:
-                        self._add("SPLINE", pts, lay)
-                except:
-                    pass
-            elif t in ("TEXT", "MTEXT"):
-                try:
-                    pos = ent.dxf.insert
-                    txt = ent.dxf.text if t == "TEXT" else ent.plain_mtext()
-                    txt = txt.strip()
-                    px, py = pos.x*sc, pos.y*sc
-                    if txt:
-                        h = max(getattr(ent.dxf, "height", 3)*sc, 0.2)
-                        self.entities.append({
-                            "type": "TEXT", "points": [(px, py)],
-                            "text": txt, "height": h, "layer": lay,
-                            "color": LAYER_COLORS.get(lay, DEFAULT_COLOR)
-                        })
+                        self._add("SPLINE", pts, lay, 0)
                 except:
                     pass
 
@@ -416,10 +409,11 @@ class AAMAParser:
         if xs:
             self.bounds = (min(xs), min(ys), max(xs), max(ys))
 
-    def _add(self, etype, pts, layer):
+    def _add(self, etype, pts, layer, piece_index=0):
         self.entities.append({
             "type": etype, "points": pts, "layer": layer,
-            "color": LAYER_COLORS.get(layer, DEFAULT_COLOR)
+            "color": LAYER_COLORS.get(layer, DEFAULT_COLOR),
+            "piece_index": piece_index
         })
 
     def _parse_meta(self, txt):
@@ -430,20 +424,24 @@ class AAMAParser:
                 if v:
                     self.metadata[key] = v
 
-    def _arc_pts(self, arc, sc, min_steps=128):
-        """FIXED: Dynamic steps based on arc length for smooth curves"""
+    def _arc_pts(self, arc, sc, insert_point=None, min_steps=128):
+        """Dynamic steps based on arc length (Lectra standard)"""
         try:
-            cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
+            if insert_point:
+                cx = (arc.dxf.center.x + insert_point.x) * sc
+                cy = (arc.dxf.center.y + insert_point.y) * sc
+            else:
+                cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
             r = arc.dxf.radius*sc
             sa = math.radians(arc.dxf.start_angle)
             ea = math.radians(arc.dxf.end_angle)
             if ea < sa:
                 ea += 2*math.pi
             
-            # Calculate arc length
-            arc_len = r * (ea - sa)
-            # Dynamic steps: 1 step per 1mm of arc length, minimum 128 steps
-            steps = max(min_steps, int(arc_len * 10))
+            # Calculate arc length in mm
+            arc_len_mm = r * (ea - sa) * 10  # cm → mm
+            # Dynamic steps: 1 step per 0.5mm, minimum 128
+            steps = max(min_steps, int(arc_len_mm * 2))
             
             return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
                      cy+r*math.sin(sa+(ea-sa)*i/steps))
@@ -452,11 +450,11 @@ class AAMAParser:
             return []
 
     def _circle_pts(self, cx, cy, r, min_steps=256):
-        """FIXED: Dynamic steps based on circumference for smooth circles"""
-        # Calculate circumference
-        circ = 2 * math.pi * r
-        # Dynamic steps: 1 step per 1mm of circumference, minimum 256 steps
-        steps = max(min_steps, int(circ * 10))
+        """Dynamic steps based on circumference (Lectra standard)"""
+        # Calculate circumference in mm
+        circ_mm = 2 * math.pi * r * 10  # cm → mm
+        # Dynamic steps: 1 step per 0.5mm, minimum 256
+        steps = max(min_steps, int(circ_mm * 2))
         
         return [(cx+r*math.cos(2*math.pi*i/steps),
                  cy+r*math.sin(2*math.pi*i/steps))
@@ -467,13 +465,17 @@ class AAMAParser:
 # ═══════════════════════════════════════════════
 class PreviewRenderer:
     BG = (13, 15, 20)
+    GRID_MAJ = (35, 42, 65)
+    GRID_MIN = (20, 26, 44)
+    RULER_BG = (18, 22, 38)
+    RULER_FG = (110, 140, 200)
 
-    def render(self, parser, cw, ch, zoom=1.0):
+    def render(self, parser, cw, ch, zoom=1.0, pan_x=0.0, pan_y=0.0):
         img = Image.new("RGB", (cw, ch), self.BG)
         draw = ImageDraw.Draw(img)
         
         if not parser.entities or not parser.bounds:
-            draw.text((cw//2-100, ch//2), "DXF ফাইল আপলোড করুন", fill=(120, 140, 180))
+            draw.text((cw//2-130, ch//2), "Preview খালি", fill=(120, 140, 180))
             return img
         
         b = parser.bounds
@@ -486,19 +488,36 @@ class PreviewRenderer:
         base = min(aw/dw, ah/dh) * 0.88
         scale = base * zoom
         
-        cx = RULER + aw/2
-        cy = RULER + ah/2
+        cx = RULER + aw/2 + pan_x
+        cy = RULER + ah/2 + pan_y
         mxc = (b[0]+b[2])/2
         myc = (b[1]+b[3])/2
         
         def tx(x): return cx + (x-mxc)*scale
         def ty(y): return cy - (y-myc)*scale
         
-        # Draw ALL graded sizes WITH LABELS
+        # Grid
+        for step, col in [(1, self.GRID_MIN), (10, self.GRID_MAJ)]:
+            gx = math.floor(b[0]/step)*step
+            while gx <= b[2]+step:
+                sx = int(tx(gx))
+                if RULER <= sx <= cw:
+                    draw.line([(sx, RULER), (sx, ch)], fill=col, width=1)
+                gx += step
+            gy = math.floor(b[1]/step)*step
+            while gy <= b[3]+step:
+                sy = int(ty(gy))
+                if RULER <= sy <= ch:
+                    draw.line([(RULER, sy), (cw, sy)], fill=col, width=1)
+                gy += step
+        
+        # Graded sizes
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             sample = parser.rul_parser.sample
             for si, sname in enumerate(sizes):
+                if sname == sample:
+                    continue
                 polys = parser.graded_polys.get(sname, [])
                 col = GRADE_COLORS[si % len(GRADE_COLORS)]
                 for poly_pts in polys:
@@ -508,26 +527,34 @@ class PreviewRenderer:
                     for i in range(len(sc2)-1):
                         x1, y1 = sc2[i]
                         x2, y2 = sc2[i+1]
-                        if RULER <= x1 <= cw and RULER <= y1 <= ch and \
-                           RULER <= x2 <= cw and RULER <= y2 <= ch:
-                            draw.line([(x1, y1), (x2, y2)], fill=col, width=2 if sname==sample else 1)
-                    
-                    # SIZE LABEL
-                    gxs = [p[0] for p in poly_pts]
-                    gys = [p[1] for p in poly_pts]
-                    lx = min(gxs)
-                    ly = min(gys) - 0.5
-                    label_x = int(tx(lx))
-                    label_y = int(ty(ly))
-                    if RULER <= label_x <= cw and RULER <= label_y <= ch:
-                        draw.rectangle([label_x-2, label_y-12, label_x+50, label_y+2], fill=(0,0,0))
-                        draw.text((label_x, label_y-10), f"Size: {sname}", fill=col, font_size=10)
+                        if max(x1, x2) >= RULER and min(x1, x2) <= cw and \
+                           max(y1, y2) >= RULER and min(y1, y2) <= ch:
+                            draw.line([(x1, y1), (x2, y2)], fill=col, width=1)
         
-        # Draw ALL entities (sew, grain, notches, etc.)
-        for ent in parser.entities:
+        # Base entities
+        order = ["7", "2", "13", "14", "8", "4", "1"]
+        by_lay = {}
+        for e in parser.entities:
+            by_lay.setdefault(e.get("layer", "1"), []).append(e)
+        draw_order = []
+        for l in order:
+            draw_order.extend(by_lay.get(l, []))
+        for l, es in by_lay.items():
+            if l not in order:
+                draw_order.extend(es)
+        
+        for ent in draw_order:
             pts = ent["points"]
-            lay = ent.get("layer", "1")
+            etype = ent["type"]
             col = ent.get("color", DEFAULT_COLOR)
+            lay = ent.get("layer", "1")
+            
+            if etype == "TEXT":
+                if pts:
+                    sx, sy = int(tx(pts[0][0])), int(ty(pts[0][1]))
+                    if RULER <= sx <= cw and RULER <= sy <= ch:
+                        draw.text((sx, sy), ent.get("text", " ")[:40], fill=col)
+                continue
             if len(pts) < 2:
                 continue
             lw = 2 if lay == "1" else 1
@@ -535,28 +562,32 @@ class PreviewRenderer:
             for i in range(len(sc2)-1):
                 x1, y1 = sc2[i]
                 x2, y2 = sc2[i+1]
-                if RULER <= x1 <= cw and RULER <= y1 <= ch and \
-                   RULER <= x2 <= cw and RULER <= y2 <= ch:
+                if max(x1, x2) >= RULER and min(x1, x2) <= cw and \
+                   max(y1, y2) >= RULER and min(y1, y2) <= ch:
                     draw.line([(x1, y1), (x2, y2)], fill=col, width=lw)
+        
+        # Rulers
+        draw.rectangle([0, 0, cw, RULER], fill=self.RULER_BG)
+        draw.rectangle([0, 0, RULER, ch], fill=self.RULER_BG)
         
         w_cm = round(dw, 1)
         h_cm = round(dh, 1)
         n_sz = len(parser.graded_polys) if parser.graded_polys else 1
         draw.text((RULER+6, 10),
-                  f"  {w_cm}x{h_cm}cm  zoom{zoom:.1f}x  sizes:{n_sz}",
-                  fill=(110, 140, 200))
+                  f"  {w_cm}×{h_cm}cm  zoom{zoom:.1f}×  sizes:{n_sz}",
+                  fill=self.RULER_FG)
         
         return img
 
 # ═══════════════════════════════════════════════
-# EXPORTERS - CLO-Compatible
+# EXPORTERS (Lectra Compatible)
 # ═══════════════════════════════════════════════
-class PDFExporter:
+class ActualSizePDFExporter:
     MARGIN = 1.5
     
     def export(self, parser, out_path):
         if not parser.bounds:
-            raise RuntimeError("No geometry")
+            raise RuntimeError("Geometry নেই।")
         b = parser.bounds
         pad = self.MARGIN
         ox = -b[0]+pad
@@ -565,13 +596,11 @@ class PDFExporter:
         ph = (b[3]-b[1]+2*pad)*cm
         
         c = pdf_canvas.Canvas(out_path, pagesize=(pw, ph))
-        c.setTitle("DXF Pattern - All Sizes")
-        c.setSubject("Do Not Scale - Actual Size 1:1")
+        c.setTitle("Lectra Pattern – Actual Size 1:1")
         
         def px(x): return (x+ox)*cm
         def py(y): return (y+oy)*cm
         
-        # Draw ALL graded sizes
         if parser.graded_polys and parser.rul_parser:
             sizes = parser.rul_parser.sizes
             for si, sname in enumerate(sizes):
@@ -589,15 +618,13 @@ class PDFExporter:
                         p.lineTo(px(pt[0]), py(pt[1]))
                     c.drawPath(p, stroke=1, fill=0)
                     
-                    # SIZE LABEL
                     gxs = [pt[0] for pt in poly_pts]
                     gys = [pt[1] for pt in poly_pts]
                     lx = min(gxs)
                     ly = min(gys) - 0.7
-                    c.setFont("Helvetica-Bold", 8)
+                    c.setFont("Helvetica-Bold", 7)
                     c.drawString(px(lx), py(ly), f"Size: {sname}")
         
-        # Draw ALL other entities
         for ent in parser.entities:
             lay = ent.get("layer", "1")
             if lay == "7":
@@ -616,201 +643,12 @@ class PDFExporter:
         c.showPage()
         c.save()
 
-class AIExporter:
-    def export(self, parser, out_path):
-        if not parser.bounds:
-            raise RuntimeError("No geometry")
-        
-        if parser.graded_polys and parser.rul_parser:
-            self._export_ai_ocg(parser, out_path)
-        else:
-            self._export_ai_flat(parser, out_path)
-    
-    def _export_ai_flat(self, parser, out_path):
-        b = parser.bounds
-        pad = 1.5
-        ox = -b[0]+pad
-        oy = -b[1]+pad
-        pw = (b[2]-b[0]+2*pad)*cm
-        ph = (b[3]-b[1]+2*pad)*cm
-        
-        tmp_path = out_path.replace(".ai", "_tmp.pdf")
-        c = pdf_canvas.Canvas(tmp_path, pagesize=(pw, ph))
-        
-        def px(x): return (x+ox)*cm
-        def py(y): return (y+oy)*cm
-        
-        for ent in parser.entities:
-            pts = ent["points"]
-            if len(pts) < 2:
-                continue
-            c.setLineWidth(0.3)
-            c.setStrokeColorRGB(0, 0, 0)
-            p = c.beginPath()
-            p.moveTo(px(pts[0][0]), py(pts[0][1]))
-            for pt in pts[1:]:
-                p.lineTo(px(pt[0]), py(pt[1]))
-            c.drawPath(p, stroke=1, fill=0)
-        
-        c.showPage()
-        c.save()
-        
-        with open(tmp_path, "rb") as f:
-            pdf_data = f.read()
-        ai_prefix = (b"%!PS-Adobe-3.0\n"
-                     b"%%Creator: Adobe Illustrator 26.0\n"
-                     b"%%Title: Pattern\n%%EndComments\n")
-        with open(out_path, "wb") as f:
-            f.write(ai_prefix)
-            f.write(pdf_data)
-        os.remove(tmp_path)
-    
-    def _export_ai_ocg(self, parser, out_path):
-        try:
-            from pikepdf import Pdf, Dictionary, Array, Name, Stream, Page
-        except:
-            self._export_ai_flat(parser, out_path)
-            return
-        
-        b = parser.bounds
-        pad = 1.5
-        ox = -b[0]+pad
-        oy = -b[1]+pad
-        pw = (b[2]-b[0]+2*pad)*cm
-        ph = (b[3]-b[1]+2*pad)*cm
-        
-        pdf = Pdf.new()
-        font_res = Dictionary(
-            HelvBd=Dictionary(Type=Name.Font, Subtype=Name.Type1,
-                              BaseFont=Name("/Helvetica-Bold"))
-        )
-        
-        form_xobjects = {}
-        ocgs = {}
-        
-        sizes = parser.rul_parser.sizes
-        for si, sname in enumerate(sizes):
-            polys = parser.graded_polys.get(sname, [])
-            col = GRADE_COLORS[si % len(GRADE_COLORS)]
-            r, g, b2 = col[0]/255, col[1]/255, col[2]/255
-            
-            content = f"{r:.3f} {g:.3f} {b2:.3f} RG\n"
-            content += f"{r:.3f} {g:.3f} {b2:.3f} rg\n"
-            content += "0.5 w\n"
-            
-            for poly_pts in polys:
-                if len(poly_pts) < 2:
-                    continue
-                content += f"{(poly_pts[0][0]+ox)*cm:.3f} {(poly_pts[0][1]+oy)*cm:.3f} m\n"
-                for pt in poly_pts[1:]:
-                    content += f"{(pt[0]+ox)*cm:.3f} {(pt[1]+oy)*cm:.3f} l\n"
-                content += "S\n"
-                
-                gxs = [p[0] for p in poly_pts]
-                gys = [p[1] for p in poly_pts]
-                lx = min(gxs)
-                ly = min(gys) - 0.7
-                safe = f"Size: {sname}".replace('(', '\\(').replace(')', '\\)')
-                content += f"BT\n/HelvBd 8 Tf\n"
-                content += f"{(lx+ox)*cm:.3f} {(ly+oy)*cm:.3f} Td\n"
-                content += f"({safe}) Tj\nET\n"
-            
-            form = pdf.make_indirect(Stream(
-                pdf, content.encode(),
-                **{
-                    "/Type": Name.XObject,
-                    "/Subtype": Name.Form,
-                    "/BBox": Array([0, 0, pw, ph]),
-                    "/Resources": Dictionary(Font=font_res)
-                }
-            ))
-            form_xobjects[sname] = form
-            ocgs[sname] = pdf.make_indirect(
-                Dictionary(Type=Name.OCG, Name=f"Size {sname}"))
-        
-        other_content = "0 0 0 RG\n0 0 0 rg\n0.25 w\n"
-        has_other = False
-        for ent in parser.entities:
-            lay = ent.get("layer", "1")
-            if lay in ("7", "1"):
-                continue
-            pts = ent["points"]
-            if len(pts) < 2:
-                continue
-            has_other = True
-            other_content += f"{(pts[0][0]+ox)*cm:.3f} {(pts[0][1]+oy)*cm:.3f} m\n"
-            for pt in pts[1:]:
-                other_content += f"{(pt[0]+ox)*cm:.3f} {(pt[1]+oy)*cm:.3f} l\n"
-            other_content += "S\n"
-        
-        other_form = None
-        other_ocg = None
-        if has_other:
-            other_form = pdf.make_indirect(Stream(
-                pdf, other_content.encode(),
-                **{"/Type": Name.XObject, "/Subtype": Name.Form,
-                   "/BBox": Array([0, 0, pw, ph]), "/Resources": Dictionary()}
-            ))
-            other_ocg = pdf.make_indirect(
-                Dictionary(Type=Name.OCG, Name="Sew/Grain Lines"))
-        
-        page_content = ""
-        xobj_names = {}
-        for sname in sizes:
-            pk = f"OC{sname.replace('-','').replace(' ','')}"
-            xkey = f"XO{sname.replace('-','').replace(' ','')}"
-            xobj_names[sname] = xkey
-            page_content += f"/OC /{pk} BDC\n/{xkey} Do\nEMC\n"
-        if has_other:
-            page_content += "/OC /OCOther BDC\n/XOOther Do\nEMC\n"
-        
-        xobj_dict = {xobj_names[s]: form_xobjects[s] for s in sizes}
-        props_dict = {f"OC{s.replace('-','').replace(' ','')}": ocgs[s] for s in sizes}
-        if has_other:
-            xobj_dict["XOOther"] = other_form
-            props_dict["OCOther"] = other_ocg
-        
-        resources = Dictionary(
-            XObject=Dictionary(**xobj_dict),
-            Properties=Dictionary(**props_dict),
-            Font=font_res
-        )
-        
-        cs = Stream(pdf, page_content.encode())
-        page_obj = pdf.make_indirect(Dictionary(
-            Type=Name.Page, MediaBox=Array([0, 0, pw, ph]),
-            Contents=pdf.make_indirect(cs), Resources=resources))
-        pdf.pages.append(Page(page_obj))
-        
-        ocg_list = [ocgs[s] for s in sizes]
-        if has_other:
-            ocg_list.append(other_ocg)
-        pdf.Root.OCProperties = Dictionary(
-            OCGs=Array(ocg_list),
-            D=Dictionary(Name="Grading Sizes", Order=Array(ocg_list),
-                         ON=Array(ocg_list), BaseState=Name.ON))
-        pdf.trailer.Info = pdf.make_indirect(Dictionary(
-            Title="DXF Pattern - All Sizes with Labels",
-            Creator=f"Flaremo DXF Converter {VERSION}"))
-        
-        tmp = out_path.replace(".ai", "__ocg__.pdf")
-        pdf.save(tmp)
-        with open(tmp, "rb") as f:
-            pdf_data = f.read()
-        ai_prefix = (b"%!PS-Adobe-3.0\n"
-                     b"%%Creator: Adobe Illustrator 26.0\n"
-                     b"%%Title: Pattern_Graded_Layers\n%%EndComments\n")
-        with open(out_path, "wb") as f:
-            f.write(ai_prefix)
-            f.write(pdf_data)
-        os.remove(tmp)
-
 class SVGExporter:
     PAD = 15.0
     
     def export(self, parser, out_path):
         if not parser.bounds:
-            raise RuntimeError("No geometry")
+            raise RuntimeError("Geometry নেই।")
         
         if parser.graded_polys and parser.rul_parser:
             self._export_graded(parser, out_path)
@@ -828,7 +666,7 @@ class SVGExporter:
         
         all_pts = [p for polys in all_mm.values() for poly in polys for p in poly]
         if not all_pts:
-            raise RuntimeError("No geometry")
+            raise RuntimeError("Geometry নেই।")
         
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
@@ -847,7 +685,6 @@ class SVGExporter:
             f'<svg xmlns="http://www.w3.org/2000/svg"',
             f'    width="{svg_w:.3f}mm" height="{svg_h:.3f}mm"',
             f'    viewBox="0 0 {svg_w:.3f} {svg_h:.3f}">',
-            f'  <!-- Flaremo DXF Converter {VERSION} - Actual Size 1:1 -->',
             ''
         ]
         
@@ -856,7 +693,6 @@ class SVGExporter:
             col = GRADE_COLORS_HEX[si % len(GRADE_COLORS_HEX)]
             sw = "0.5" if sname == parser.rul_parser.sample else "0.3"
             
-            lines.append(f'  <!-- Size {sname} -->')
             lines.append(f'  <g id="Size_{sname}">')
             
             for poly in polys:
@@ -880,52 +716,27 @@ class SVGExporter:
             lines.append(f'  </g>')
             lines.append('')
         
-        # Export ALL entities (FIXED - was missing before!)
+        # All other entities
         entity_lines = []
         for ent in parser.entities:
             lay = ent.get("layer", "1")
             if lay == "7":
                 continue
-            
             if ent["type"] == "TEXT":
-                if ent["points"]:
-                    px, py = ent["points"][0]
-                    txt = ent.get("text", "")
-                    if txt and not txt.startswith('#'):
-                        entity_lines.append(f'   <text x="{sx(px*10)}" y="{sy(py*10)}"')
-                        entity_lines.append(f'        font-family="Helvetica,Arial,sans-serif"')
-                        entity_lines.append(f'        font-size="6" fill="#888888">{txt}</text>')
                 continue
-            
             if len(ent["points"]) < 2:
                 continue
-            
             pts_mm = [(p[0]*10, p[1]*10) for p in ent["points"]]
-            col_ent = {
-                "14": "#50DC50", "8": "#C8A000", "4": "#FF6464",
-                "2": "#A0C8FF", "13": "#C896FF",
-            }.get(lay, "#888888")
-            
-            sw_ent = {
-                "14": "0.25", "8": "0.3", "4": "0.4",
-                "2": "0.25", "13": "0.25",
-            }.get(lay, "0.25")
-            
+            col_ent = {"14": "#50DC50", "8": "#C8A000", "4": "#FF6464"}.get(lay, "#888888")
             d = f"M {sx(pts_mm[0][0])},{sy(pts_mm[0][1])}"
             for pt in pts_mm[1:]:
                 d += f" L {sx(pt[0])},{sy(pt[1])}"
-            
-            entity_lines.append(f'   <path d="{d}"')
-            entity_lines.append(f'        fill="none" stroke="{col_ent}"')
-            entity_lines.append(f'        stroke-width="{sw_ent}"')
-            entity_lines.append(f'        stroke-dasharray="2,2"/>')
+            entity_lines.append(f'   <path d="{d}" fill="none" stroke="{col_ent}" stroke-width="0.25"/>')
         
         if entity_lines:
-            lines.append('   <!-- All Position Marks, Notches, Grain Lines -->')
-            lines.append('   <g id="All_Marks_Notches" stroke-linecap="round">')
+            lines.append('   <g id="All_Marks_Notches">')
             lines.extend(entity_lines)
             lines.append('   </g>')
-            lines.append('')
         
         lines.append('</svg>')
         
@@ -938,7 +749,7 @@ class SVGExporter:
             for p in e["points"]:
                 all_pts.append((p[0]*10, p[1]*10))
         if not all_pts:
-            raise RuntimeError("No geometry")
+            raise RuntimeError("Geometry নেই।")
         
         xs = [p[0] for p in all_pts]
         ys = [p[1] for p in all_pts]
@@ -1014,7 +825,7 @@ def upload():
         session_id = request.remote_addr
         active_parser[session_id] = parser
         
-        img = PreviewRenderer().render(parser, 800, 600, 1.0)
+        img = PreviewRenderer().render(parser, 800, 600, 1.0, 0.0, 0.0)
         buffer = io.BytesIO()
         img.save(buffer, format='PNG')
         preview_b64 = base64.b64encode(buffer.getvalue()).decode()
@@ -1023,20 +834,14 @@ def upload():
         w = round(b[2]-b[0], 1) if b else 0
         h = round(b[3]-b[1], 1) if b else 0
         n_grades = len(parser.graded_polys) if parser.graded_polys else 0
-        
-        piece_count = 0
-        if parser.graded_polys:
-            for size_name, polys in parser.graded_polys.items():
-                piece_count = len(polys)
-                break
+        n_pieces = len(parser._piece_positions) if parser._piece_positions else 1
         
         return jsonify({
             'success': True,
             'preview': preview_b64,
-            'info': f"Entities: {len(parser.entities)}\nWidth: {w} cm\nHeight: {h} cm\nGrading: {n_grades} sizes\nPieces: {piece_count}",
+            'info': f"Entities: {len(parser.entities)}\nWidth: {w} cm\nHeight: {h} cm\nGrading: {n_grades} sizes\nPieces: {n_pieces}",
             'has_grading': n_grades > 0,
-            'piece_count': piece_count,
-            'grade_indices_count': len(parser.grade_indices)
+            'piece_count': n_pieces
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -1060,7 +865,7 @@ def upload_rul():
         parser = active_parser[session_id]
         parser.attach_rul(rul)
         
-        img = PreviewRenderer().render(parser, 800, 600, 1.0)
+        img = PreviewRenderer().render(parser, 800, 600, 1.0, 0.0, 0.0)
         buffer = io.BytesIO()
         img.save(buffer, format='PNG')
         preview_b64 = base64.b64encode(buffer.getvalue()).decode()
@@ -1091,9 +896,7 @@ def export():
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
         if format_type == 'pdf':
-            PDFExporter().export(parser, output_path)
-        elif format_type == 'ai':
-            AIExporter().export(parser, output_path)
+            ActualSizePDFExporter().export(parser, output_path)
         elif format_type == 'svg':
             SVGExporter().export(parser, output_path)
         elif format_type == 'dxf':
