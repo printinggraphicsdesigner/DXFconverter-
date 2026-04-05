@@ -1,6 +1,7 @@
 flask==3.0.0
 flask-cors==4.0.0
 reportlab==4.0.7
-ezdxf==1.1.0
-Pillow>=11.0.0
+ezdxf>=1.1.0
+Pillow>=10.2.0
 gunicorn==21.2.0
+customtkinter>=5.2.0
