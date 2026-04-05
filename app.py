@@ -21,9 +21,7 @@ OUTPUT_FOLDER = tempfile.mkdtemp()
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
-# ═══════════════════════════════════════════════
-# COLORS (Desktop App Exact)
-# ═══════════════════════════════════════════════
+# COLORS
 BG_DARK = "#0A0A0A"
 BG_PANEL = "#111111"
 BG_CARD = "#1A1A1A"
@@ -51,9 +49,6 @@ GRADE_COLORS_HEX = [
 
 active_parser = {}
 
-# ═══════════════════════════════════════════════
-# RUL PARSER (Desktop App Exact)
-# ═══════════════════════════════════════════════
 class RULParser:
     def __init__(self):
         self.sizes = []
@@ -89,9 +84,6 @@ class RULParser:
             return self.rules[rule_num][size_idx]
         return (0.0, 0.0)
 
-# ═══════════════════════════════════════════════
-# GRADING ENGINE (Desktop App Exact)
-# ═══════════════════════════════════════════════
 def _arc_length(pts, i1, i2):
     total = 0.0
     for k in range(i1, i2):
@@ -165,9 +157,6 @@ def compute_graded_poly(base_pts, grade_indices, rul, size_idx):
     
     return graded
 
-# ═══════════════════════════════════════════════
-# DXF PARSER (Desktop App Exact)
-# ═══════════════════════════════════════════════
 class AAMAParser:
     def __init__(self):
         self.entities = []
@@ -271,11 +260,12 @@ class AAMAParser:
                         self._base_cut_polys.append(pts)
 
             elif t == "SPLINE":
-    try:
-        # FIXED: Use 0.01 tolerance instead of 0.5 for smooth curves
-        pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.01)]
-        if pts: self._add("SPLINE", pts, lay)
-    except: pass
+                try:
+                    pts = [(p[0]*sc, p[1]*sc) for p in ent.flattening(0.01)]
+                    if pts:
+                        self._add("SPLINE", pts, lay)
+                except:
+                    pass
 
             elif t == "LINE":
                 s, e = ent.dxf.start, ent.dxf.end
@@ -390,41 +380,31 @@ class AAMAParser:
                 if v:
                     self.metadata[key] = v
 
-   def _arc_pts(self, arc, sc, min_steps=128):
-    """Dynamic steps based on arc length for smooth curves"""
-    try:
-        cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
-        r = arc.dxf.radius*sc
-        sa = math.radians(arc.dxf.start_angle)
-        ea = math.radians(arc.dxf.end_angle)
-        if ea < sa:
-            ea += 2*math.pi
-        
-        # Calculate arc length in mm
-        arc_len_mm = r * (ea - sa) * 10  # cm → mm
-        # Dynamic steps: 1 step per 0.5mm, minimum 128
-        steps = max(min_steps, int(arc_len_mm * 2))
-        
-        return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
-                 cy+r*math.sin(sa+(ea-sa)*i/steps))
+    def _arc_pts(self, arc, sc, min_steps=128):
+        """Dynamic steps based on arc length for smooth curves"""
+        try:
+            cx, cy = arc.dxf.center.x*sc, arc.dxf.center.y*sc
+            r = arc.dxf.radius*sc
+            sa = math.radians(arc.dxf.start_angle)
+            ea = math.radians(arc.dxf.end_angle)
+            if ea < sa:
+                ea += 2*math.pi
+            arc_len_mm = r * (ea - sa) * 10
+            steps = max(min_steps, int(arc_len_mm * 2))
+            return [(cx+r*math.cos(sa+(ea-sa)*i/steps),
+                     cy+r*math.sin(sa+(ea-sa)*i/steps))
+                    for i in range(steps+1)]
+        except:
+            return []
+
+    def _circle_pts(self, cx, cy, r, min_steps=256):
+        """Dynamic steps based on circumference for smooth circles"""
+        circ_mm = 2 * math.pi * r * 10
+        steps = max(min_steps, int(circ_mm * 2))
+        return [(cx+r*math.cos(2*math.pi*i/steps),
+                 cy+r*math.sin(2*math.pi*i/steps))
                 for i in range(steps+1)]
-    except:
-        return []
 
-def _circle_pts(self, cx, cy, r, min_steps=256):
-    """Dynamic steps based on circumference for smooth circles"""
-    # Calculate circumference in mm
-    circ_mm = 2 * math.pi * r * 10  # cm → mm
-    # Dynamic steps: 1 step per 0.5mm, minimum 256
-    steps = max(min_steps, int(circ_mm * 2))
-    
-    return [(cx+r*math.cos(2*math.pi*i/steps),
-             cy+r*math.sin(2*math.pi*i/steps))
-            for i in range(steps+1)]
-
-# ═══════════════════════════════════════════════
-# PREVIEW RENDERER (Desktop App Exact)
-# ═══════════════════════════════════════════════
 class PreviewRenderer:
     BG = (13, 15, 20)
     GRID_MAJ = (35, 42, 65)
@@ -574,9 +554,6 @@ class PreviewRenderer:
         
         return img
 
-# ═══════════════════════════════════════════════
-# PDF EXPORTER (Desktop App Exact - with size labels)
-# ═══════════════════════════════════════════════
 class ActualSizePDFExporter:
     MARGIN = 1.5
     LAYER_STROKE = {"1": 0.4, "14": 0.25, "8": 0.3, "4": 0.5, "7": 0.1}
@@ -677,9 +654,6 @@ class ActualSizePDFExporter:
         c.showPage()
         c.save()
 
-# ═══════════════════════════════════════════════
-# SVG EXPORTER (Desktop App Exact - with groups & labels)
-# ═══════════════════════════════════════════════
 class SVGExporter:
     PAD = 15.0
     
@@ -836,9 +810,6 @@ class SVGExporter:
             '',
         ]
 
-# ═══════════════════════════════════════════════
-# API ROUTES
-# ═══════════════════════════════════════════════
 @app.route('/api/upload', methods=['POST'])
 def upload():
     try:
